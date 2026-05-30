@@ -1,0 +1,502 @@
+#!/usr/bin/env bash
+#
+# vps-harden.sh
+# ----------------------------------------------------------------------------
+# Update, harden, audit and (optionally) install Dokploy on a fresh
+# Ubuntu / Debian VPS (tested on Ubuntu 22.04 / 24.04).
+#
+# What it does, in order:
+#   1.  Pre-flight checks (root, OS, internet)
+#   2.  Full system update + automatic security updates
+#   3.  Create a non-root sudo user with your SSH key
+#   4.  Harden SSH (no root login, no passwords, custom port)
+#   5.  Firewall (UFW) + Dokploy-aware Docker firewall rules
+#   6.  Fail2ban (brute-force protection)
+#   7.  Kernel / sysctl network hardening
+#   8.  Shared-memory, core-dump and misc hardening
+#   9.  Optional: install Dokploy
+#   10. Security audit with a 0-100 score + report file
+#
+# Usage:
+#   chmod +x vps-harden.sh
+#   sudo ./vps-harden.sh                 # interactive
+#   sudo ./vps-harden.sh --audit-only    # just score, change nothing
+#   sudo ./vps-harden.sh --no-dokploy    # harden but skip Dokploy
+#   sudo ./vps-harden.sh --yes           # non-interactive (uses env vars / defaults)
+#
+# Configure with environment variables (or answer the prompts):
+#   NEW_USER=deploy
+#   SSH_PORT=2222
+#   SSH_PUBKEY="ssh-ed25519 AAAA... you@host"
+#   INSTALL_DOKPLOY=yes|no
+#
+# License: MIT. No warranty. Read it before you run it.
+# ----------------------------------------------------------------------------
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Colours & logging
+# ----------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  RED=$'\033[0;31m'; GRN=$'\033[0;32m'; YLW=$'\033[1;33m'
+  BLU=$'\033[0;34m'; BLD=$'\033[1m';   NC=$'\033[0m'
+else
+  RED=''; GRN=''; YLW=''; BLU=''; BLD=''; NC=''
+fi
+
+log()   { echo "${BLU}[*]${NC} $*"; }
+ok()    { echo "${GRN}[+]${NC} $*"; }
+warn()  { echo "${YLW}[!]${NC} $*"; }
+err()   { echo "${RED}[x]${NC} $*" >&2; }
+hr()    { echo "${BLD}------------------------------------------------------------${NC}"; }
+
+# ----------------------------------------------------------------------------
+# Globals
+# ----------------------------------------------------------------------------
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+REPORT="/root/vps-harden-report-${TIMESTAMP}.txt"
+AUDIT_ONLY="no"
+ASSUME_YES="no"
+SCORE=0
+MAX_SCORE=0
+
+# Defaults (overridable by env or prompt)
+NEW_USER="${NEW_USER:-}"
+SSH_PORT="${SSH_PORT:-22}"
+SSH_PUBKEY="${SSH_PUBKEY:-}"
+INSTALL_DOKPLOY="${INSTALL_DOKPLOY:-}"
+
+# ----------------------------------------------------------------------------
+# Arg parsing
+# ----------------------------------------------------------------------------
+for arg in "$@"; do
+  case "$arg" in
+    --audit-only) AUDIT_ONLY="yes" ;;
+    --no-dokploy) INSTALL_DOKPLOY="no" ;;
+    --yes|-y)     ASSUME_YES="yes" ;;
+    --help|-h)
+      grep '^#' "$0" | sed 's/^#\s\?//' | head -n 40
+      exit 0 ;;
+    *) err "Unknown option: $arg"; exit 1 ;;
+  esac
+done
+
+# ----------------------------------------------------------------------------
+# Audit helpers
+# ----------------------------------------------------------------------------
+audit() {
+  # audit "<weight>" "<name>" "pass|warn|fail" "<message>"
+  local weight="$1" name="$2" status="$3" msg="$4" color tag
+  MAX_SCORE=$(( MAX_SCORE + weight ))
+  case "$status" in
+    pass) SCORE=$(( SCORE + weight ));   color="$GRN"; tag="PASS" ;;
+    warn) SCORE=$(( SCORE + weight/2 )); color="$YLW"; tag="WARN" ;;
+    fail)                                color="$RED"; tag="FAIL" ;;
+  esac
+  printf '%s[%s]%s %s%-22s%s %s\n' "$color" "$tag" "$NC" "$BLD" "$name" "$NC" "$msg"
+  printf '[%-4s] %-22s %s\n' "$tag" "$name" "$msg" >> "$REPORT"
+}
+
+confirm() {
+  # confirm "question" -> returns 0 for yes
+  [[ "$ASSUME_YES" == "yes" ]] && return 0
+  local reply
+  read -r -p "${YLW}[?]${NC} $1 [y/N] " reply
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+ask() {
+  # ask "prompt" "default" -> echoes answer
+  local prompt="$1" default="$2" reply
+  if [[ "$ASSUME_YES" == "yes" ]]; then echo "$default"; return; fi
+  read -r -p "${BLU}[?]${NC} $prompt [$default]: " reply
+  echo "${reply:-$default}"
+}
+
+# ----------------------------------------------------------------------------
+# Pre-flight
+# ----------------------------------------------------------------------------
+preflight() {
+  hr; log "Pre-flight checks"
+  if [[ "$EUID" -ne 0 ]]; then err "Run as root (use sudo)."; exit 1; fi
+
+  if [[ -r /etc/os-release ]]; then
+    . /etc/os-release
+    case "$ID" in
+      ubuntu|debian) ok "Detected $PRETTY_NAME" ;;
+      *) warn "OS '$ID' is untested. This script targets Ubuntu/Debian." ;;
+    esac
+  else
+    warn "Cannot detect OS (no /etc/os-release)."
+  fi
+
+  if ping -c1 -W3 1.1.1.1 >/dev/null 2>&1; then ok "Internet reachable"
+  else err "No internet connectivity."; exit 1; fi
+
+  echo "VPS Harden Report - $TIMESTAMP" > "$REPORT"
+  echo "Host: $(hostname)  |  $PRETTY_NAME" >> "$REPORT"
+  hr >> "$REPORT" 2>/dev/null || true
+}
+
+# ----------------------------------------------------------------------------
+# 1. System update
+# ----------------------------------------------------------------------------
+do_update() {
+  hr; log "Updating system packages"
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -y
+  apt-get upgrade -y
+  apt-get dist-upgrade -y
+  apt-get install -y \
+    ufw fail2ban unattended-upgrades apt-listchanges \
+    curl wget ca-certificates gnupg lsb-release \
+    net-tools auditd >/dev/null 2>&1 || \
+    apt-get install -y ufw fail2ban unattended-upgrades curl wget
+  ok "Packages updated and base tooling installed"
+
+  log "Enabling unattended security upgrades"
+  cat >/etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+EOF
+  systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
+  ok "Automatic security updates enabled"
+}
+
+# ----------------------------------------------------------------------------
+# 2. Non-root sudo user + SSH key
+# ----------------------------------------------------------------------------
+do_user() {
+  hr; log "Setting up a non-root sudo user"
+
+  [[ -z "$NEW_USER" ]] && NEW_USER="$(ask 'Username for new sudo user (blank to skip)' '')"
+  if [[ -z "$NEW_USER" ]]; then warn "Skipping user creation."; return; fi
+
+  if id "$NEW_USER" >/dev/null 2>&1; then
+    ok "User '$NEW_USER' already exists"
+  else
+    adduser --disabled-password --gecos "" "$NEW_USER"
+    ok "Created user '$NEW_USER'"
+  fi
+  usermod -aG sudo "$NEW_USER"
+
+  if [[ -z "$SSH_PUBKEY" ]]; then
+    warn "No SSH public key provided (SSH_PUBKEY env var)."
+    SSH_PUBKEY="$(ask 'Paste an SSH public key for this user (blank to skip)' '')"
+  fi
+
+  if [[ -n "$SSH_PUBKEY" ]]; then
+    local home; home="$(eval echo "~$NEW_USER")"
+    install -d -m 700 -o "$NEW_USER" -g "$NEW_USER" "$home/.ssh"
+    echo "$SSH_PUBKEY" >> "$home/.ssh/authorized_keys"
+    sort -u "$home/.ssh/authorized_keys" -o "$home/.ssh/authorized_keys"
+    chmod 600 "$home/.ssh/authorized_keys"
+    chown "$NEW_USER:$NEW_USER" "$home/.ssh/authorized_keys"
+    ok "Installed SSH key for '$NEW_USER'"
+  else
+    warn "No key installed. Do NOT disable password auth until you can log in with this user!"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 3. SSH hardening
+# ----------------------------------------------------------------------------
+do_ssh() {
+  hr; log "Hardening SSH"
+
+  [[ "$SSH_PORT" == "22" ]] && SSH_PORT="$(ask 'SSH port to use (non-default recommended)' '22')"
+
+  local can_disable_pw="yes"
+  local home; home="$(eval echo "~${NEW_USER:-root}")"
+  if [[ -z "$SSH_PUBKEY" && ! -s "$home/.ssh/authorized_keys" && ! -s /root/.ssh/authorized_keys ]]; then
+    can_disable_pw="no"
+    warn "No SSH key detected anywhere - keeping password auth ON to avoid lockout."
+  fi
+
+  install -d -m 755 /etc/ssh/sshd_config.d
+  cat >/etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+# Managed by vps-harden.sh ($TIMESTAMP)
+Port ${SSH_PORT}
+Protocol 2
+PermitRootLogin no
+PubkeyAuthentication yes
+PasswordAuthentication $([[ "$can_disable_pw" == "yes" ]] && echo no || echo yes)
+ChallengeResponseAuthentication no
+KbdInteractiveAuthentication no
+UsePAM yes
+X11Forwarding no
+AllowAgentForwarding no
+AllowTcpForwarding no
+PermitEmptyPasswords no
+MaxAuthTries 3
+MaxSessions 5
+LoginGraceTime 30
+ClientAliveInterval 300
+ClientAliveCountMax 2
+EOF
+
+  if sshd -t 2>/dev/null; then
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    ok "SSH hardened (port $SSH_PORT, root login off, password auth $([[ "$can_disable_pw" == "yes" ]] && echo disabled || echo kept))"
+    warn "Keep your current session open. Test a NEW login before closing it:"
+    echo "    ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>"
+  else
+    err "sshd config test failed - reverting."
+    rm -f /etc/ssh/sshd_config.d/99-hardening.conf
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 4. Firewall (UFW) - Dokploy / Docker aware
+# ----------------------------------------------------------------------------
+do_firewall() {
+  hr; log "Configuring UFW firewall"
+
+  ufw --force reset >/dev/null
+  ufw default deny incoming
+  ufw default allow outgoing
+  ufw allow "${SSH_PORT}/tcp" comment 'SSH'
+
+  if [[ "${INSTALL_DOKPLOY}" == "yes" ]]; then
+    ufw allow 80/tcp   comment 'HTTP (Traefik)'
+    ufw allow 443/tcp  comment 'HTTPS (Traefik)'
+    ufw allow 443/udp  comment 'HTTP/3 (Traefik)'
+    warn "Dokploy panel runs on port 3000. Leave it CLOSED in UFW and reach it via SSH tunnel:"
+    echo "    ssh -p ${SSH_PORT} -L 3000:localhost:3000 ${NEW_USER:-root}@<server-ip>"
+    echo "    then open http://localhost:3000"
+  fi
+
+  ufw --force enable
+  ok "UFW enabled"
+
+  # --- Docker bypasses UFW. Fix it. ---
+  # Docker writes its own iptables rules and ignores UFW, exposing any
+  # published container port to the world. ufw-docker closes that gap.
+  if command -v docker >/dev/null 2>&1 || [[ "${INSTALL_DOKPLOY}" == "yes" ]]; then
+    log "Applying Docker<->UFW fix (ufw-docker)"
+    if [[ ! -f /usr/local/bin/ufw-docker ]]; then
+      curl -fsSL -o /usr/local/bin/ufw-docker \
+        https://raw.githubusercontent.com/chaifeng/ufw-docker/master/ufw-docker 2>/dev/null && \
+        chmod +x /usr/local/bin/ufw-docker || warn "Could not fetch ufw-docker; do it manually later."
+    fi
+    if [[ -x /usr/local/bin/ufw-docker ]]; then
+      /usr/local/bin/ufw-docker install >/dev/null 2>&1 || true
+      systemctl restart ufw 2>/dev/null || true
+      ok "Docker traffic now respects UFW (published ports are no longer auto-exposed)"
+    fi
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# 5. Fail2ban
+# ----------------------------------------------------------------------------
+do_fail2ban() {
+  hr; log "Configuring Fail2ban"
+  cat >/etc/fail2ban/jail.local <<EOF
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+backend  = systemd
+
+[sshd]
+enabled  = true
+port     = ${SSH_PORT}
+maxretry = 3
+bantime  = 24h
+EOF
+  systemctl enable --now fail2ban >/dev/null 2>&1 || systemctl restart fail2ban
+  ok "Fail2ban active (SSH jail, ban after 3 fails)"
+}
+
+# ----------------------------------------------------------------------------
+# 6. Kernel / sysctl hardening
+# ----------------------------------------------------------------------------
+do_sysctl() {
+  hr; log "Applying kernel network hardening"
+  cat >/etc/sysctl.d/99-vps-harden.conf <<'EOF'
+# Spoof protection
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+# Ignore ICMP redirects / source routing
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.all.accept_source_route = 0
+# SYN flood protection
+net.ipv4.tcp_syncookies = 1
+# Log martians
+net.ipv4.conf.all.log_martians = 1
+# Ignore broadcast pings
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+# ASLR
+kernel.randomize_va_space = 2
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+  ok "sysctl hardening applied"
+}
+
+# ----------------------------------------------------------------------------
+# 7. Misc hardening
+# ----------------------------------------------------------------------------
+do_misc() {
+  hr; log "Misc hardening (shared memory, core dumps)"
+  if ! grep -q '/run/shm' /etc/fstab 2>/dev/null; then
+    echo "tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0" >> /etc/fstab
+  fi
+  cat >/etc/security/limits.d/99-no-core.conf <<'EOF'
+* hard core 0
+EOF
+  echo "kernel.core_pattern=/dev/null" >/etc/sysctl.d/99-no-coredump.conf
+  sysctl -p /etc/sysctl.d/99-no-coredump.conf >/dev/null 2>&1 || true
+  ok "Core dumps disabled, /run/shm mounted noexec on next boot"
+}
+
+# ----------------------------------------------------------------------------
+# 8. Optional Dokploy install
+# ----------------------------------------------------------------------------
+do_dokploy() {
+  hr; log "Dokploy installation"
+  if [[ -z "$INSTALL_DOKPLOY" ]]; then
+    if confirm "Install Dokploy now?"; then INSTALL_DOKPLOY="yes"; else INSTALL_DOKPLOY="no"; fi
+  fi
+  if [[ "$INSTALL_DOKPLOY" != "yes" ]]; then warn "Skipping Dokploy."; return; fi
+
+  for p in 80 443 3000; do
+    if ss -tulnp 2>/dev/null | grep -q ":$p "; then
+      err "Port $p is already in use. Dokploy needs 80, 443 and 3000 free. Aborting Dokploy install."
+      return
+    fi
+  done
+
+  log "Running official Dokploy installer (this can take a few minutes)..."
+  curl -sSL https://dokploy.com/install.sh | sh
+  ok "Dokploy installed. Panel: http://<server-ip>:3000 (or via SSH tunnel)."
+  warn "Re-run the firewall step if you installed Docker for the first time:"
+  echo "    sudo /usr/local/bin/ufw-docker install && sudo systemctl restart ufw"
+}
+
+# ----------------------------------------------------------------------------
+# 9. Security audit / score
+# ----------------------------------------------------------------------------
+run_audit() {
+  hr; log "Running security audit"
+  echo; echo "${BLD}Security checks${NC}"; hr
+
+  # SSH root login
+  if sshd -T 2>/dev/null | grep -qi '^permitrootlogin no'; then
+    audit 10 "SSH root login" pass "Root login disabled"
+  else audit 10 "SSH root login" fail "Root login still permitted"; fi
+
+  # SSH password auth
+  if sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then
+    audit 10 "SSH password auth" pass "Password auth disabled (keys only)"
+  else audit 10 "SSH password auth" warn "Password authentication still enabled"; fi
+
+  # SSH port
+  local port; port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+  if [[ "$port" != "22" ]]; then audit 5 "SSH port" pass "Non-default port ($port)"
+  else audit 5 "SSH port" warn "Using default port 22"; fi
+
+  # UFW
+  if ufw status 2>/dev/null | grep -qi 'Status: active'; then
+    audit 15 "Firewall (UFW)" pass "UFW is active"
+  else audit 15 "Firewall (UFW)" fail "UFW is not active"; fi
+
+  # Fail2ban
+  if systemctl is-active --quiet fail2ban; then audit 10 "Fail2ban" pass "Running"
+  else audit 10 "Fail2ban" fail "Not running"; fi
+
+  # Unattended upgrades
+  if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
+    audit 10 "Auto security updates" pass "Enabled"
+  else audit 10 "Auto security updates" warn "Not enabled"; fi
+
+  # Pending updates
+  local upd; upd="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || echo 0)"
+  if [[ "$upd" -eq 0 ]]; then audit 10 "Pending updates" pass "System up to date"
+  elif [[ "$upd" -lt 10 ]]; then audit 10 "Pending updates" warn "$upd updates pending"
+  else audit 10 "Pending updates" fail "$upd updates pending"; fi
+
+  # sysctl hardening
+  if [[ -f /etc/sysctl.d/99-vps-harden.conf ]]; then audit 5 "Kernel hardening" pass "sysctl profile present"
+  else audit 5 "Kernel hardening" warn "No sysctl hardening profile"; fi
+
+  # Non-root sudo user
+  if [[ -n "$NEW_USER" ]] && id "$NEW_USER" >/dev/null 2>&1; then
+    audit 5 "Non-root sudo user" pass "'$NEW_USER' exists"
+  else audit 5 "Non-root sudo user" warn "No dedicated sudo user detected"; fi
+
+  # Docker / UFW fix
+  if command -v docker >/dev/null 2>&1; then
+    if [[ -x /usr/local/bin/ufw-docker ]] && iptables -L DOCKER-USER -n 2>/dev/null | grep -q .; then
+      audit 5 "Docker firewall" pass "ufw-docker rules in place"
+    else audit 5 "Docker firewall" warn "Docker present but UFW fix not confirmed"; fi
+  fi
+
+  echo; echo "${BLD}Resource snapshot${NC}"; hr
+  printf 'Disk:   %s\n' "$(df -h / | awk 'NR==2{print $5" used of "$2}')" | tee -a "$REPORT"
+  printf 'Memory: %s\n' "$(free -h | awk '/Mem:/{print $3" used of "$2}')" | tee -a "$REPORT"
+  printf 'Uptime: %s\n' "$(uptime -p 2>/dev/null || uptime)" | tee -a "$REPORT"
+
+  # Final score
+  local pct=0
+  [[ "$MAX_SCORE" -gt 0 ]] && pct=$(( SCORE * 100 / MAX_SCORE ))
+  local grade color
+  if   [[ $pct -ge 90 ]]; then grade="A - Excellent"; color="$GRN"
+  elif [[ $pct -ge 75 ]]; then grade="B - Good";      color="$GRN"
+  elif [[ $pct -ge 60 ]]; then grade="C - Fair";      color="$YLW"
+  elif [[ $pct -ge 40 ]]; then grade="D - Weak";      color="$YLW"
+  else                         grade="F - At risk";   color="$RED"; fi
+
+  echo; hr
+  echo "${BLD}SECURITY SCORE: ${color}${pct}/100  (${grade})${NC}"
+  hr
+  {
+    echo ""
+    echo "SECURITY SCORE: ${pct}/100 (${grade})  [$SCORE of $MAX_SCORE weighted points]"
+  } >> "$REPORT"
+  ok "Report saved to $REPORT"
+}
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+main() {
+  preflight
+
+  if [[ "$AUDIT_ONLY" == "yes" ]]; then
+    run_audit
+    exit 0
+  fi
+
+  echo
+  warn "This will modify SSH, firewall and system settings."
+  warn "Keep your current SSH session OPEN and test a new login before disconnecting."
+  confirm "Continue with hardening?" || { log "Aborted."; exit 0; }
+
+  do_update
+  do_user
+  do_dokploy      # decide Dokploy first so firewall opens the right ports
+  do_ssh
+  do_firewall
+  do_fail2ban
+  do_sysctl
+  do_misc
+  run_audit
+
+  hr
+  ok "Done."
+  echo "Next steps:"
+  echo "  1. In a NEW terminal: ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>"
+  echo "  2. Confirm you can log in, THEN close this session."
+  [[ "$INSTALL_DOKPLOY" == "yes" ]] && \
+    echo "  3. Reach Dokploy via tunnel: ssh -p ${SSH_PORT} -L 3000:localhost:3000 ${NEW_USER:-root}@<server-ip>  ->  http://localhost:3000"
+  echo "  Re-audit anytime: sudo ./vps-harden.sh --audit-only"
+}
+
+main "$@"
