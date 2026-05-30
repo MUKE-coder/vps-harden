@@ -66,6 +66,7 @@ NEW_USER="${NEW_USER:-}"
 SSH_PORT="${SSH_PORT:-22}"
 SSH_PUBKEY="${SSH_PUBKEY:-}"
 INSTALL_DOKPLOY="${INSTALL_DOKPLOY:-}"
+GENERATED_KEY_FILE=""
 
 # ----------------------------------------------------------------------------
 # Arg parsing
@@ -183,8 +184,49 @@ do_user() {
   usermod -aG sudo "$NEW_USER"
 
   if [[ -z "$SSH_PUBKEY" ]]; then
-    warn "No SSH public key provided (SSH_PUBKEY env var)."
-    SSH_PUBKEY="$(ask 'Paste an SSH public key for this user (blank to skip)' '')"
+    echo
+    warn "No SSH key was provided."
+    echo "An SSH key is what lets you log in securely without a password."
+    echo "You have two options:"
+    echo "  ${BLD}A)${NC} You already made a key on your laptop - paste the PUBLIC key now."
+    echo "     (On your laptop it's shown by: cat ~/.ssh/id_ed25519.pub)"
+    echo "  ${BLD}B)${NC} You have no key yet - let this script make one FOR you."
+    echo
+    SSH_PUBKEY="$(ask 'Paste your public key, or leave BLANK to have one generated for you' '')"
+  fi
+
+  # Option B: no key pasted -> generate a fresh pair on the server.
+  if [[ -z "$SSH_PUBKEY" ]]; then
+    log "Generating a new SSH key pair for you..."
+    local keydir="/root/vps-harden-keys"
+    local keyfile="$keydir/${NEW_USER}_key"
+    install -d -m 700 "$keydir"
+    if [[ ! -f "$keyfile" ]]; then
+      ssh-keygen -t ed25519 -N "" -C "${NEW_USER}@$(hostname)" -f "$keyfile" >/dev/null
+    fi
+    SSH_PUBKEY="$(cat "${keyfile}.pub")"
+    GENERATED_KEY_FILE="$keyfile"
+    ok "Created a key pair for you."
+    echo
+    echo "${BLD}>>> ACTION REQUIRED: save your PRIVATE key to your laptop <<<${NC}"
+    echo "This secret key is your ONLY way to log in after this. Copy it now."
+    echo
+    echo "${BLD}Easiest way:${NC} on your LAPTOP, open a new terminal and run this single line"
+    echo "(replace the IP with your server's IP). It copies the key down for you:"
+    echo
+    echo "    ${BLD}scp root@<server-ip>:${keyfile} ~/.ssh/${NEW_USER}_key${NC}"
+    echo
+    echo "Then fix its permissions on your laptop so SSH will accept it:"
+    echo "    ${BLD}chmod 600 ~/.ssh/${NEW_USER}_key${NC}"
+    echo
+    echo "After that you'll log in from your laptop with:"
+    echo "    ${BLD}ssh -i ~/.ssh/${NEW_USER}_key -p <ssh-port> ${NEW_USER}@<server-ip>${NC}"
+    echo
+    warn "Do this BEFORE you close your current connection. The script will remind you again at the end."
+    echo
+    if [[ "$ASSUME_YES" != "yes" ]]; then
+      read -r -p "${YLW}[?]${NC} Press Enter once you understand (you'll copy the key shortly)... " _
+    fi
   fi
 
   if [[ -n "$SSH_PUBKEY" ]]; then
@@ -196,7 +238,7 @@ do_user() {
     chown "$NEW_USER:$NEW_USER" "$home/.ssh/authorized_keys"
     ok "Installed SSH key for '$NEW_USER'"
   else
-    warn "No key installed. Do NOT disable password auth until you can log in with this user!"
+    warn "No key installed. Password auth will stay ON to avoid locking you out."
   fi
 }
 
@@ -492,15 +534,30 @@ main() {
   hr
   ok "Done. Your server has been hardened."
   echo
-  echo "${BLD}>>> IMPORTANT: do this BEFORE closing this window <<<${NC}"
-  echo "On your LAPTOP, open a NEW terminal window and test the new login:"
-  echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>${NC}"
+  if [[ -n "$GENERATED_KEY_FILE" ]]; then
+    echo "${BLD}>>> FIRST: copy your private key to your laptop (if you haven't) <<<${NC}"
+    echo "On your LAPTOP:"
+    echo "    scp root@<server-ip>:${GENERATED_KEY_FILE} ~/.ssh/${NEW_USER}_key"
+    echo "    chmod 600 ~/.ssh/${NEW_USER}_key"
+    echo
+    echo "${BLD}>>> THEN test the new login BEFORE closing this window <<<${NC}"
+    echo "On your LAPTOP, in a NEW terminal:"
+    echo "    ${BLD}ssh -i ~/.ssh/${NEW_USER}_key -p ${SSH_PORT} ${NEW_USER}@<server-ip>${NC}"
+  else
+    echo "${BLD}>>> IMPORTANT: do this BEFORE closing this window <<<${NC}"
+    echo "On your LAPTOP, open a NEW terminal window and test the new login:"
+    echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>${NC}"
+  fi
   echo "  - If it works: you can safely close THIS window. You're done."
   echo "  - If it fails: keep THIS window open and fix it here."
   [[ "$INSTALL_DOKPLOY" == "yes" ]] && {
     echo
     echo "To open Dokploy, run this on your LAPTOP, then visit http://localhost:3000 :"
-    echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-root}@<server-ip> -L 3000:localhost:3000${NC}"
+    if [[ -n "$GENERATED_KEY_FILE" ]]; then
+      echo "    ${BLD}ssh -i ~/.ssh/${NEW_USER}_key -p ${SSH_PORT} ${NEW_USER}@<server-ip> -L 3000:localhost:3000${NC}"
+    else
+      echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-root}@<server-ip> -L 3000:localhost:3000${NC}"
+    fi
   }
   echo
   echo "Re-check your security score anytime:  sudo ./vps-harden.sh --audit-only"

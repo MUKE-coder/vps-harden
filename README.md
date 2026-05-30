@@ -2,78 +2,58 @@
 
 > One simple script to secure a brand-new Ubuntu/Debian VPS — and optionally install [Dokploy](https://dokploy.com). It cleans up your server's security, then gives you a **0–100 score** so you can see how safe it is.
 
-## 🛑 Read this first (especially if you're new)
+**Made for total beginners.** If all you have is your server's **IP address** and **root password** from Contabo (or Hetzner, DigitalOcean, etc.), this guide is for you. You don't need to know anything about SSH keys — the script can make one for you.
 
-There are **two different computers** involved, and mixing them up is the #1 mistake beginners make:
+---
 
-| | What it is | What you do here |
+## 🛑 The one thing to understand before anything else
+
+There are **two different computers** involved. Mixing them up is the #1 beginner mistake:
+
+| | What it is | Your role |
 |---|---|---|
-| 💻 **Your laptop** | The computer in front of you | Connect to the server, make your SSH key |
-| ☁️ **Your VPS / server** | The remote machine you rented (Contabo, Hetzner, etc.) | **This is where the script runs** |
+| 💻 **Your laptop / PC** | The computer in front of you right now | You type commands here to control the server |
+| ☁️ **Your VPS (server)** | The remote machine you rented | **This is where the script runs** |
 
-👉 **You run this script ON THE SERVER, not on your laptop.** You first connect to the server from your laptop using SSH, and then you run everything inside that connection.
+👉 You connect *from* your laptop *to* the server, then run the script **on the server**.
 
-Think of it like a video call: your laptop is *you*, the server is the *person you called*. The script does its work on their side, you're just controlling it through the call.
-
----
-
-## Why you need this
-
-The moment your new server gets a public IP, bots on the internet start trying to break into it — guessing passwords, scanning for open doors. A fresh server is wide open. This script closes those doors before the bots get in.
+Think of it like a phone call: your laptop is *you*, the server is the *person you called*. The work happens on their side — you're just talking to them through the call. Below, every step is marked 💻 (do on your laptop) or ☁️ (do on the server) so you always know where you are.
 
 ---
 
-## What it does, in plain English
+## Why bother?
 
-- ✅ Installs all the latest security updates (and keeps installing them automatically)
-- ✅ Creates a normal user for you so you stop logging in as the all-powerful "root"
-- ✅ Locks down SSH (how you remotely connect) so only **you** with your key can get in
-- ✅ Turns on a firewall that blocks everything except what you actually need
-- ✅ Adds Fail2ban, which auto-bans anyone trying to guess your password
-- ✅ Fixes a hidden flaw where Docker quietly pokes holes in your firewall
-- ✅ **Optionally** installs Dokploy (the tool you use to deploy your apps)
-- ✅ Gives you a **security score out of 100** at the end so you know you're safe
+The second your new server goes live, bots across the internet start trying to break into it — guessing passwords, scanning for open doors, 24/7. A fresh server is wide open. This script locks the doors before they get in.
 
 ---
 
-## Step-by-step guide (start to finish)
+## Step-by-step (from "I just got my server" to "it's secured")
 
-### Step 1 — Make an SSH key on your laptop 💻
+### Step 1 — Open a terminal on your laptop 💻
 
-An SSH key is like a digital lock-and-key. The **public** half goes on the server; the **private** half stays secret on your laptop. This is what lets you log in without a password.
-
-Open a terminal **on your laptop** and run:
-
-```bash
-ssh-keygen -t ed25519 -C "you@laptop"
-```
-
-Press Enter to accept the defaults. Then show your **public** key (the safe one to share):
-
-```bash
-cat ~/.ssh/id_ed25519.pub
-```
-
-Copy the whole line it prints (starts with `ssh-ed25519 ...`). You'll paste it later. **Keep this terminal handy.**
-
-> Already have a key? Skip to Step 2 — just run that `cat` command to grab your public key.
+- **Windows:** press the Start button, type **PowerShell**, open it.
+- **Mac:** press `Cmd + Space`, type **Terminal**, open it.
+- **Linux:** open your **Terminal** app.
 
 ### Step 2 — Connect to your server 💻 ➜ ☁️
 
-Your VPS provider gave you an IP address and (usually) a root password or key. From your laptop:
+Contabo gave you an **IP address** and a **root password**. In the terminal, type (replace `YOUR-SERVER-IP` with your real IP):
 
 ```bash
 ssh root@YOUR-SERVER-IP
 ```
 
-Replace `YOUR-SERVER-IP` with your real IP. Type `yes` if it asks about a fingerprint. **You are now "inside" the server** — every command from here runs on the server.
+- If it asks `Are you sure you want to continue connecting?`, type `yes` and press Enter.
+- It will ask for your **root password** — type it (you won't see anything as you type, that's normal) and press Enter.
+
+✅ You're now **inside the server**. Everything you type from here runs on the server.
 
 ### Step 3 — Download and run the script ☁️
 
-Now that you're on the server, grab the script and run it:
+Copy and paste these lines one block at a time:
 
 ```bash
-# Install git if it's missing (harmless if already there)
+# Make sure git is available (safe to run even if it already is)
 sudo apt update && sudo apt install -y git
 
 # Download the script
@@ -85,46 +65,64 @@ chmod +x vps-harden.sh
 sudo ./vps-harden.sh
 ```
 
-The script will ask you a few simple questions:
-- A username for your new account (e.g. `deploy`)
-- An SSH port (just press Enter to keep the suggested one)
-- Your SSH **public** key — paste the line you copied in Step 1
-- Whether to install Dokploy — type `y` or `n`
+The script asks you a few easy questions:
 
-Then it does its work and prints your security score.
+- **A username** for your everyday account — type something simple like `deploy`.
+- **An SSH port** — just press Enter to accept the suggestion.
+- **An SSH key** — here you have two choices:
+  - If you've never made one, **just leave it blank and press Enter** → the script makes a key *for you*. ⭐ (recommended for beginners)
+  - If you already have a key on your laptop, paste your public key instead.
+- **Install Dokploy?** — type `y` for yes or `n` for no.
 
-### Step 4 — ⚠️ TEST YOUR NEW LOGIN BEFORE CLOSING ANYTHING ⚠️
+### Step 4 — If the script made a key for you: save it to your laptop ☁️ ➜ 💻
 
-This is the most important step. The script changed how you log in. You must prove the new way works **before** you disconnect, or you could lock yourself out of your own server.
+If you left the key blank, the script created one on the server and showed you instructions. You must copy the **private key** down to your laptop — it's your only way back in.
 
-**Leave your current server connection open.** Open a **brand-new terminal window on your laptop** 💻 and try the new login:
+Open a **new terminal window on your laptop** 💻 and run the line the script showed you (it looks like this):
 
 ```bash
-ssh -p YOUR-SSH-PORT YOUR-NEW-USERNAME@YOUR-SERVER-IP
+scp root@YOUR-SERVER-IP:/root/vps-harden-keys/deploy_key ~/.ssh/deploy_key
+chmod 600 ~/.ssh/deploy_key
 ```
 
-(The script prints this exact command for you at the end — copy it from there.)
+(`deploy` will be whatever username you chose. On Windows PowerShell, `scp` works the same way.)
 
-- ✅ **If it works:** great! You can now close the old window. You're done.
-- ❌ **If it fails:** don't panic. Go back to your **still-open** first window and you can fix it. This is exactly why we keep it open.
+> Skipped the key and let the script generate one? This step is required. If you pasted your own key, you can skip it.
+
+### Step 5 — ⚠️ TEST YOUR NEW LOGIN BEFORE CLOSING ANYTHING ⚠️
+
+This is the most important step. The script changed how you log in. You must prove the new way works **before** disconnecting, or you could lock yourself out of your own server.
+
+**Keep your original server window open.** In the **new laptop terminal** 💻, try the new login. The script prints the exact command for you — it looks like one of these:
+
+```bash
+# If the script generated a key for you:
+ssh -i ~/.ssh/deploy_key -p YOUR-SSH-PORT deploy@YOUR-SERVER-IP
+
+# If you pasted your own key:
+ssh -p YOUR-SSH-PORT deploy@YOUR-SERVER-IP
+```
+
+- ✅ **If it logs in:** great! You can now close the old window. Done — your server is secured.
+- ❌ **If it fails:** don't panic. Go back to your **still-open** first window and fix it (or re-run the script). That's exactly why we kept it open.
 
 ---
 
 ## Reaching Dokploy (if you installed it)
 
-For safety, Dokploy's control panel is **not** exposed to the public internet. You reach it through a secure tunnel from your laptop:
+For safety, Dokploy's control panel is **not** open to the public internet. You reach it through a private tunnel. On **your laptop** 💻:
 
 ```bash
-ssh -p YOUR-SSH-PORT -L 3000:localhost:3000 YOUR-USERNAME@YOUR-SERVER-IP
+ssh -i ~/.ssh/deploy_key -p YOUR-SSH-PORT deploy@YOUR-SERVER-IP -L 3000:localhost:3000
 ```
 
-Leave that running, then open **http://localhost:3000** in your laptop's browser. Create your account (the first one becomes admin) and turn on two-factor authentication.
+(Drop the `-i ~/.ssh/deploy_key` part if you used your own key.) Leave that window running, then open **http://localhost:3000** in your laptop's browser. Create your account (first user becomes admin) and turn on two-factor authentication.
 
 ---
 
-## Checking your security later
+## Checking your security score later
 
-Run this **on the server** anytime to re-check your score (it only looks, it changes nothing):
+Run this **on the server** ☁️ anytime — it only looks, it changes nothing:
 
 ```bash
 cd vps-harden
@@ -141,6 +139,21 @@ SECURITY SCORE: 92/100  (A - Excellent)
 
 Aim for an **A (90+)**. A full report is also saved on the server at `/root/vps-harden-report-<date>.txt`.
 
+| Check | Points |
+|-------|-------:|
+| Root login over SSH disabled | 10 |
+| Password login disabled (key only) | 10 |
+| Using a non-standard SSH port | 5 |
+| Firewall turned on | 15 |
+| Fail2ban running | 10 |
+| Automatic security updates on | 10 |
+| No updates pending | 10 |
+| Kernel hardening applied | 5 |
+| You have a non-root user | 5 |
+| Docker firewall fix in place | 5 |
+
+A warning gives half points; a failure gives zero.
+
 ---
 
 ## Options (for later, once you're comfortable)
@@ -149,29 +162,30 @@ Aim for an **A (90+)**. A full report is also saved on the server at `/root/vps-
 |---------|--------------|
 | `sudo ./vps-harden.sh` | Normal run, asks you questions |
 | `sudo ./vps-harden.sh --audit-only` | Just check the score, change nothing |
-| `sudo ./vps-harden.sh --no-dokploy` | Harden the server but skip Dokploy |
+| `sudo ./vps-harden.sh --no-dokploy` | Secure the server but skip Dokploy |
 | `sudo ./vps-harden.sh --help` | Show help |
 
-To get newer versions later, run `git pull` inside the `vps-harden` folder on the server.
+Get newer versions later with `git pull` inside the `vps-harden` folder.
 
 ---
 
 ## Requirements
 
-- A fresh Ubuntu 22.04 / 24.04 or Debian server (works best on a clean one)
-- The ability to SSH into it (your provider gives you this)
+- A fresh Ubuntu 22.04 / 24.04 or Debian server
+- Your server's IP address and root password (that's all you need)
 
 ---
 
-## A few honest notes
+## Honest notes
 
 - This is a strong **starting point**, not a magic shield. Keep your apps updated and make backups.
-- Always feel free to read the script before running it — every part is commented in plain language.
-- It's built for Ubuntu/Debian. On other systems it'll warn you and behaviour isn't tested.
+- The auto-generated key is convenient and safe, but treat the private key file like a password — never share it.
+- Feel free to read the script first; every part is commented in plain language.
+- Built and tested for Ubuntu/Debian.
 
 ## Contributing
 
-Found a bug or have an idea? Open an issue or pull request — beginners welcome.
+Beginners welcome — open an issue or pull request.
 
 ## License
 
