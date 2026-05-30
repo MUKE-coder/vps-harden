@@ -156,6 +156,122 @@ A warning gives half points; a failure gives zero.
 
 ---
 
+---
+
+## 🚨 Emergencies & "uh oh" situations
+
+Things go wrong. Here are the scenarios beginners actually hit, and exactly how to fix each one. Most are recoverable — don't panic.
+
+### 😱 My laptop was stolen / lost
+
+This is serious: whoever has your laptop has your **private key**, which means they can log into your server as you. Act fast.
+
+**If you can still get into your server another way** (e.g. from a different computer, or your provider's web console — see below), do this immediately:
+
+```bash
+# 1. Log into the server, then remove the stolen key from your account
+nano ~/.ssh/authorized_keys
+# Delete the line for the compromised key, save with Ctrl+O then Enter, exit with Ctrl+X
+
+# 2. Make a brand-new key on your SAFE computer (see "I lost my key" below),
+#    then add its PUBLIC key to the server:
+echo "ssh-ed25519 AAAA...your-NEW-public-key... you@newlaptop" >> ~/.ssh/authorized_keys
+
+# 3. As a safety net, also change passwords and check who's logged in:
+sudo passwd deploy        # change your user's password
+who                       # see active sessions
+sudo lastlog              # see recent logins
+```
+
+If you genuinely can't get in at all, use your **provider's web console** (next section) to do the same thing. When in doubt on a server holding anything important, the safest move is to wipe and rebuild it, then re-run this script — a stolen key plus your server IP is enough for an attacker to have already gotten in.
+
+> **Prevention:** put a passphrase on your key (`ssh-keygen -p -f ~/.ssh/deploy_key`), and use full-disk encryption on your laptop (BitLocker on Windows, FileVault on Mac). With both, a stolen laptop is far less useful to a thief.
+
+### 🔑 I lost / deleted my private key (or it got corrupted)
+
+Your private key is gone, so you can't log in with it anymore. You need another way in, then you install a fresh key.
+
+**Your rescue door is your provider's web console.** Contabo, Hetzner, DigitalOcean, etc. all give you a browser-based terminal that connects to the server screen *directly*, bypassing SSH entirely. In Contabo it's under your **VPS control panel → "VNC / Web Console" (or "Rescue")**. Log in there with your **root password**.
+
+Once you're in via the console:
+
+```bash
+# Make a NEW key. On your laptop:
+ssh-keygen -t ed25519 -f ~/.ssh/deploy_key_new
+
+# Show the new PUBLIC key on your laptop and copy it:
+cat ~/.ssh/deploy_key_new.pub
+
+# Back in the server console, paste it into your account:
+echo "PASTE-YOUR-NEW-PUBLIC-KEY-HERE" >> /home/deploy/.ssh/authorized_keys
+```
+
+Now you can SSH in normally with the new key. (If you never want to deal with this again, you can also temporarily re-enable password login from the console — see "I'm fully locked out" below.)
+
+### 🚪 "Permission denied (publickey)" when I try to log in
+
+SSH found your account but rejected your key. Common causes:
+
+- **Wrong key file.** Make sure you're pointing at the right one: `ssh -i ~/.ssh/deploy_key -p PORT deploy@IP`.
+- **Wrong permissions on your laptop.** SSH refuses keys that aren't locked down. Fix it on your laptop: `chmod 600 ~/.ssh/deploy_key`.
+- **Wrong username.** It's your created user (e.g. `deploy`), not `root` (root login is disabled on purpose).
+- **The public key never got onto the server.** Use the web console to check `/home/deploy/.ssh/authorized_keys` actually contains your key.
+
+### ⏱️ "Connection refused" or "Connection timed out"
+
+- **Wrong port.** The script moved SSH off port 22. Add `-p YOUR-PORT` to your command. Forgot the port? Check it from the web console: `sudo sshd -T | grep -i '^port'`.
+- **Firewall / SSH not running.** From the web console: `sudo systemctl status ssh` and `sudo ufw status`.
+- **Wrong IP.** Double-check the server IP from your provider's dashboard.
+
+### 🔒 I'm fully locked out (no key, can't SSH at all)
+
+Don't reinstall yet. Use the **provider's web console** (the VNC/rescue terminal in your dashboard) — it doesn't need SSH or a key, just your root password. Once inside, temporarily turn password login back on so you can get in normally and fix things:
+
+```bash
+sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/99-hardening.conf
+sudo systemctl restart ssh
+```
+
+Log in with your password, add a fresh key (see above), then turn password login back off and restart SSH again.
+
+### 🙈 I accidentally pushed my private key to GitHub (or shared it)
+
+Treat it as compromised, exactly like the stolen-laptop case: remove that key from `~/.ssh/authorized_keys` on the server, generate a new key, and add the new one. Deleting the GitHub commit is **not** enough — assume bots already grabbed it. **Never** commit anything from your `.ssh` folder; only ever share files ending in `.pub`.
+
+### 🤔 I forgot my username / SSH port / what I chose
+
+From the web console (logged in as root):
+
+```bash
+ls /home                                 # lists your usernames
+sudo sshd -T | grep -i '^port'           # shows the SSH port
+```
+
+The script also saved a report at `/root/vps-harden-report-<date>.txt` you can read with `cat`.
+
+### 🌐 Dokploy won't load at http://localhost:3000
+
+- Make sure your **tunnel** is running in another window: `ssh -i ~/.ssh/deploy_key -p PORT deploy@IP -L 3000:localhost:3000`. The tunnel must stay open while you use Dokploy.
+- Don't try `http://your-server-ip:3000` directly — port 3000 is intentionally closed to the public.
+- Check it's actually running, on the server: `docker ps | grep dokploy`.
+
+### 🚫 Fail2ban banned my own IP address
+
+If you fat-fingered your login too many times, Fail2ban may temporarily block you. Get in via the web console and unban yourself:
+
+```bash
+sudo fail2ban-client status sshd          # see banned IPs
+sudo fail2ban-client set sshd unbanip YOUR-IP-ADDRESS
+```
+
+Bans also expire on their own (24h for SSH by default).
+
+### 🔁 The script asks for a "sudo password" but I never set one
+
+The new user was created without a password and uses your key. If a command needs `sudo` and prompts for a password you don't have, set one from the web console (as root): `passwd deploy`.
+
+---
+
 ## Options (for later, once you're comfortable)
 
 | Command | What it does |
