@@ -1,171 +1,164 @@
-# Hardening a Fresh VPS (and Installing Dokploy) with One Script
+# Securing Your First VPS (and Installing Dokploy) — A Beginner's Guide
 
-If you rent VPS boxes from providers like Contabo, Hetzner or DigitalOcean and drop your apps on them with [Dokploy](https://dokploy.com), you already know the uncomfortable truth: a brand-new VPS is exposed to automated attacks within *minutes* of getting a public IP. Bots scan the entire IPv4 space constantly, hammering port 22 with credential-stuffing attempts and probing every open port for known vulnerabilities.
+If you've just rented your first VPS from somewhere like Contabo or Hetzner and you're planning to deploy apps with [Dokploy](https://dokploy.com), there's something nobody warns you about: **the moment your server gets a public IP address, bots on the internet start trying to break into it.** Within minutes. They guess passwords, scan for open ports, and probe for known weaknesses, around the clock.
 
-This post walks through `vps-harden.sh` — a single, readable Bash script that takes a fresh Ubuntu/Debian server, locks it down to a sensible baseline, optionally installs Dokploy, and then **audits itself and prints a 0–100 security score** so you can see exactly where you stand.
+A fresh server is like a house with every door and window unlocked. This guide walks you through `vps-harden.sh` — a single, friendly script that locks all those doors, optionally installs Dokploy, and then gives you a **security score out of 100** so you can actually *see* that your server is safe.
 
-It draws on well-known community hardening checklists (vps-audit, vps-harden, the Anyone relay hardening guide, and others) and folds them into one workflow that is aware of one critical gotcha: **Docker bypasses your firewall**, and Dokploy runs on Docker Swarm. More on that below.
+This is written for beginners. If you've never hardened a server before, you're in the right place.
 
 ---
 
-## TL;DR
+## First, the one thing that confuses everyone
+
+There are **two separate computers** in this whole process, and keeping them straight is the key to not getting lost:
+
+- 💻 **Your laptop** — the computer physically in front of you.
+- ☁️ **Your server (VPS)** — the remote machine you rented. You can't touch it; you control it over the internet.
+
+**The script runs on the SERVER, not on your laptop.** What you do is connect *from* your laptop *to* the server using a tool called SSH, and then you run the script while you're "inside" that connection.
+
+A helpful way to picture it: it's like a phone call. Your laptop is *you*, the server is the *person you called*. The work happens on their end — you're just talking to them through the call. Throughout this guide I'll mark each step with 💻 (do this on your laptop) or ☁️ (do this on the server) so it's always clear where you are.
+
+---
+
+## TL;DR for the impatient
 
 ```bash
-# On a fresh Ubuntu 22.04 / 24.04 VPS:
+# 💻 On your laptop: connect to the server
+ssh root@YOUR-SERVER-IP
+
+# ☁️ Now on the server: download and run
 git clone https://github.com/MUKE-coder/vps-harden.git
 cd vps-harden
 chmod +x vps-harden.sh
 sudo ./vps-harden.sh
 ```
 
-Answer a handful of prompts, keep your current SSH window open, test the new login, and you're done. Re-check the score anytime with:
-
-```bash
-sudo ./vps-harden.sh --audit-only
-```
+Answer a few questions, then **don't close anything** until you've tested your new login (explained below). That last part matters — skip it and you can lock yourself out.
 
 ---
 
-## What the script actually does
+## What the script actually does (in plain English)
 
-The script runs through nine stages. Every change is deliberate and explained inline in the source — nothing is hidden. Here is the full picture.
+You don't need to understand every detail, but here's the gist of what's happening to your server:
 
-### 1. Pre-flight checks
+1. **Installs security updates** — and sets it up to keep installing them automatically forever. Most break-ins exploit old bugs that already have fixes; this closes that gap.
+2. **Creates a normal user for you** — so you stop logging in as "root," the all-powerful account that's dangerous to use day-to-day.
+3. **Locks down SSH** — the doorway you use to connect. After this, only *you*, holding your secret key, can get in. No passwords, no root login.
+4. **Turns on a firewall** — blocks every incoming connection except the few you actually need.
+5. **Adds Fail2ban** — automatically bans any IP address that keeps guessing your password.
+6. **Fixes a sneaky Docker problem** — Docker (which Dokploy uses) secretly bypasses your firewall and can expose your apps to the world. The script patches this.
+7. **Optionally installs Dokploy** — the dashboard you'll use to deploy your apps. Totally optional; you can say no.
+8. **Hardens the system internals** — sensible kernel and memory settings that block common attacks.
+9. **Scores your security out of 100** — so you finish with proof that your server is locked down.
 
-Before touching anything it confirms it is running as root, detects the OS (warning you if it isn't Ubuntu/Debian), and verifies the box has internet. It then opens a timestamped report file in `/root/` that every audit result is written to.
-
-### 2. System update + automatic security patches
-
-It runs a full `apt update`, `upgrade` and `dist-upgrade`, installs the base tooling it needs (`ufw`, `fail2ban`, `unattended-upgrades`, `curl`, `auditd` and friends), and then **enables unattended security upgrades**. This is the single highest-value, lowest-effort thing you can do: most real-world compromises exploit known bugs that already have patches. Automatic security updates close that window without you having to remember.
-
-### 3. A non-root sudo user with your SSH key
-
-Logging in as `root` over SSH is a bad habit. The script creates a dedicated sudo user (you choose the name), drops your public key into `~/.ssh/authorized_keys` with correct `700`/`600` permissions, and adds the user to the `sudo` group. You provide the key either through the `SSH_PUBKEY` environment variable or by pasting it at the prompt.
-
-> If no key is found anywhere, the script **refuses to disable password login** later — that's a deliberate guard against locking yourself out.
-
-### 4. SSH hardening
-
-It writes a drop-in config to `/etc/ssh/sshd_config.d/99-hardening.conf` (rather than mangling the main file) that:
-
-- Moves SSH to a non-default port of your choosing (cuts background noise dramatically)
-- Disables root login (`PermitRootLogin no`)
-- Disables password authentication — **only** when a key is present
-- Turns off X11 and agent forwarding, empty passwords, and challenge-response
-- Limits auth tries to 3 and tightens session/timeout settings
-
-Crucially, it runs `sshd -t` to validate the config *before* restarting SSH, and reverts automatically if the test fails. It then reminds you to **test a new login in a separate terminal before closing your current session**.
-
-### 5. Firewall — and the Docker/Dokploy trap
-
-The script resets UFW to a deny-by-default posture, then opens only what you need: your SSH port, and (if you're installing Dokploy) ports 80, 443 and 443/UDP for Traefik.
-
-Here's the part most tutorials get wrong. **Docker publishes container ports by writing its own `iptables` rules, completely bypassing UFW.** If you `ufw deny` a port but a Docker container publishes it, the world can still reach it. Since Dokploy runs everything on Docker Swarm, this matters a lot.
-
-The script fixes this by installing [`ufw-docker`](https://github.com/chaifeng/ufw-docker), which inserts rules into the `DOCKER-USER` chain so that Docker traffic finally respects UFW. After this, published container ports are no longer automatically exposed to the internet.
-
-It also keeps the **Dokploy admin panel on port 3000 closed to the public**. You reach it through an SSH tunnel instead:
-
-```bash
-ssh -p <your-ssh-port> -L 3000:localhost:3000 <user>@<server-ip>
-# then open http://localhost:3000 in your browser
-```
-
-This means your admin dashboard is never exposed to bots — only people with SSH access can reach it.
-
-### 6. Fail2ban
-
-Brute-force protection. A jail watches the SSH log and bans an IP for 24 hours after 3 failed attempts. The jail is configured for whatever custom SSH port you chose.
-
-### 7. Kernel / network hardening (sysctl)
-
-A `sysctl` profile enables reverse-path filtering (anti-spoofing), SYN-cookie flood protection, ignores ICMP redirects and source routing, logs martian packets, ignores broadcast pings, and enforces full ASLR (`kernel.randomize_va_space = 2`).
-
-### 8. Misc hardening
-
-Core dumps are disabled (they can leak secrets from memory) and `/run/shm` is mounted `noexec,nosuid` on the next boot.
-
-### 9. Optional Dokploy install
-
-If you opt in, the script first checks that ports 80, 443 and 3000 are free (the official installer fails loudly if they aren't), then runs the official installer:
-
-```bash
-curl -sSL https://dokploy.com/install.sh | sh
-```
-
-This installs Docker if needed, initialises Docker Swarm, sets up the overlay network, and deploys Dokploy along with Postgres, Redis and Traefik. **Installing Dokploy is entirely optional** — pass `--no-dokploy`, answer "no" at the prompt, or set `INSTALL_DOKPLOY=no`.
+Everything the script changes is commented in the source in plain language, so you can read along if you're curious.
 
 ---
 
-## How to set it up
+## The full walkthrough
 
-### Step 1 — Clone the repo onto the server
+### Step 1 — Make your SSH key 💻
 
-SSH into your VPS, then clone it straight from GitHub:
+An SSH key is a pair of files: a **public** key (safe to share, goes on the server) and a **private** key (a secret, stays on your laptop). Together they let you log in securely without ever typing a password — much safer than a password a bot could guess.
 
-```bash
-git clone https://github.com/MUKE-coder/vps-harden.git
-cd vps-harden
-chmod +x vps-harden.sh
-```
-
-> If `git` isn't installed yet on a bare image: `sudo apt update && sudo apt install -y git`
-
-### Step 2 — Prepare your SSH public key
-
-On your **local** machine, if you don't already have a key:
+On **your laptop**, open a terminal and run:
 
 ```bash
 ssh-keygen -t ed25519 -C "you@laptop"
-cat ~/.ssh/id_ed25519.pub   # this is what you'll paste / pass in
 ```
 
-### Step 3 — Run it
-
-**Interactive (recommended the first time):**
+Press Enter at each question to accept the defaults. When it's done, display your **public** key:
 
 ```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+It prints one long line starting with `ssh-ed25519`. **Copy that entire line** — you'll paste it into the script shortly. Leave this terminal open.
+
+> Already made a key before? You can skip the `ssh-keygen` part and just run the `cat` command to copy your existing public key.
+
+### Step 2 — Connect to your server 💻 ➜ ☁️
+
+Your VPS provider emailed you an **IP address** and login details for your server. From your laptop's terminal, connect like this (swap in your real IP):
+
+```bash
+ssh root@YOUR-SERVER-IP
+```
+
+If it asks about a "fingerprint," type `yes` and press Enter. You may be asked for the root password your provider gave you.
+
+🎉 You're now **inside the server**. Every command you type from here on runs on the server, not your laptop.
+
+### Step 3 — Download and run the script ☁️
+
+You're on the server now. First make sure `git` is installed (this is harmless if it already is):
+
+```bash
+sudo apt update && sudo apt install -y git
+```
+
+Now download the script and run it:
+
+```bash
+git clone https://github.com/MUKE-coder/vps-harden.git
+cd vps-harden
+chmod +x vps-harden.sh
 sudo ./vps-harden.sh
 ```
 
-It will ask for the new username, SSH port, your public key, and whether to install Dokploy.
+The script will ask you some easy questions:
 
-**Non-interactive (for automation):**
+- **A username** for your new account — something simple like `deploy`.
+- **An SSH port** — just press Enter to accept the suggestion (using a non-standard port quietly hides you from most bots).
+- **Your SSH public key** — paste the line you copied in Step 1.
+- **Install Dokploy?** — type `y` for yes or `n` for no.
+
+It'll then chug away for a few minutes (updating, configuring, maybe installing Dokploy) and finish by printing your **security score**.
+
+### Step 4 — ⚠️ The step you must NOT skip ⚠️
+
+The script just changed how you log in to your server. Before you disconnect, you have to **prove the new login works** — otherwise, if something went wrong, you'd have no way back in. This is the single most common way beginners accidentally lock themselves out.
+
+Here's the safe way to test it:
+
+1. **Keep your current server window open.** Don't touch it.
+2. Open a **brand-new terminal window on your laptop** 💻.
+3. Try logging in the new way. The script prints the exact command for you at the end — it looks like this:
 
 ```bash
-sudo NEW_USER=deploy \
-     SSH_PORT=2222 \
-     SSH_PUBKEY="ssh-ed25519 AAAA... you@laptop" \
-     INSTALL_DOKPLOY=yes \
-     ./vps-harden.sh --yes
+ssh -p YOUR-SSH-PORT YOUR-USERNAME@YOUR-SERVER-IP
 ```
 
-### Available flags
-
-| Flag | Effect |
-|------|--------|
-| *(none)* | Full interactive hardening |
-| `--audit-only` | Only run the audit and print the score; changes nothing |
-| `--no-dokploy` | Harden but skip Dokploy |
-| `--yes` / `-y` | Non-interactive; uses env vars and defaults |
-| `--help` | Show usage |
-
-### Configuration via environment variables
-
-| Variable | Meaning | Example |
-|----------|---------|---------|
-| `NEW_USER` | Name of the non-root sudo user | `deploy` |
-| `SSH_PORT` | Port SSH will listen on | `2222` |
-| `SSH_PUBKEY` | Public key installed for the new user | `ssh-ed25519 AAAA...` |
-| `INSTALL_DOKPLOY` | `yes` or `no` | `yes` |
+- ✅ **If you get in:** perfect. You can now safely close the old window. You're finished and your server is secured.
+- ❌ **If it fails:** stay calm. Switch back to your **still-open** original window — you never lost access — and you can investigate or re-run the script. This is exactly why we kept it open.
 
 ---
 
-## How to check everything is good
+## How to reach Dokploy (if you installed it)
 
-### 1. Read the score
+You might expect to just visit `http://your-server-ip:3000` to see the Dokploy dashboard. The script deliberately **blocks that**, because leaving an admin panel open to the whole internet is asking for trouble.
 
-At the end of every run (and on every `--audit-only`) the script prints a weighted **security score out of 100** with a letter grade:
+Instead, you create a private, encrypted tunnel from your laptop to the server. On **your laptop** 💻:
+
+```bash
+ssh -p YOUR-SSH-PORT YOUR-USERNAME@YOUR-SERVER-IP -L 3000:localhost:3000
+```
+
+Leave that window running. Then open **http://localhost:3000** in your laptop's browser. The dashboard appears — but only *you* can reach it, because it travels through your secure SSH connection. Create your admin account (the first user to sign up becomes the admin) and turn on two-factor authentication for good measure.
+
+---
+
+## Checking your security score anytime
+
+Your security isn't "set and forget" — updates pile up, things drift. You can re-check your score whenever you like. On the **server** ☁️:
+
+```bash
+cd vps-harden
+sudo ./vps-harden.sh --audit-only
+```
+
+The `--audit-only` part means it *only looks* and changes nothing. You'll see:
 
 ```
 ============================================================
@@ -173,85 +166,43 @@ SECURITY SCORE: 92/100  (A - Excellent)
 ============================================================
 ```
 
-A full report is saved to `/root/vps-harden-report-<timestamp>.txt`. The checks and their weights:
+Aim for an **A (90 or above)**. Each item is scored and weighted:
 
-| Check | Weight | Pass condition |
-|-------|-------:|----------------|
-| SSH root login | 10 | `PermitRootLogin no` |
-| SSH password auth | 10 | Disabled (keys only) |
-| SSH port | 5 | Non-default port |
-| Firewall (UFW) | 15 | UFW active |
-| Fail2ban | 10 | Service running |
-| Auto security updates | 10 | `unattended-upgrades` enabled |
-| Pending updates | 10 | System up to date |
-| Kernel hardening | 5 | sysctl profile present |
-| Non-root sudo user | 5 | Dedicated user exists |
-| Docker firewall | 5 | `ufw-docker` rules present |
+| Check | Points |
+|-------|-------:|
+| Root login over SSH disabled | 10 |
+| Password login disabled (key only) | 10 |
+| Using a non-standard SSH port | 5 |
+| Firewall turned on | 15 |
+| Fail2ban running | 10 |
+| Automatic security updates on | 10 |
+| No updates pending | 10 |
+| Kernel hardening applied | 5 |
+| You have a non-root user | 5 |
+| Docker firewall fix in place | 5 |
 
-A `WARN` earns half marks; a `FAIL` earns zero. Aim for an A (≥90).
-
-### 2. Verify the new login *before* you disconnect
-
-This is the one rule you must not skip. In a **separate** terminal:
-
-```bash
-ssh -p <your-ssh-port> <new-user>@<server-ip>
-```
-
-If that works, you can safely close your original session. If it doesn't, you still have the old window open to fix things.
-
-### 3. Spot-check the individual pieces
-
-```bash
-# SSH effective config
-sudo sshd -T | grep -Ei 'port|permitrootlogin|passwordauthentication'
-
-# Firewall
-sudo ufw status verbose
-
-# Fail2ban status and the SSH jail
-sudo fail2ban-client status
-sudo fail2ban-client status sshd
-
-# Pending updates
-apt list --upgradable 2>/dev/null
-
-# Kernel hardening applied
-sudo sysctl net.ipv4.tcp_syncookies kernel.randomize_va_space
-```
-
-### 4. Confirm Docker is respecting the firewall
-
-If you installed Dokploy, make sure the `ufw-docker` fix is actually in place:
-
-```bash
-sudo iptables -L DOCKER-USER -n
-```
-
-You should see rules there, not an empty chain. From an **outside** machine, scan the box and confirm only your intended ports answer:
-
-```bash
-nmap -Pn <server-ip>          # run from your laptop, not the server
-```
-
-You should see your SSH port plus 80/443 if Dokploy is installed — and **not** 3000.
-
-### 5. Reach the Dokploy panel safely
-
-```bash
-ssh -p <your-ssh-port> -L 3000:localhost:3000 <user>@<server-ip>
-```
-
-Then visit `http://localhost:3000`, create your admin account (the first user becomes admin), and turn on two-factor authentication. Point your apps' domains at the server, and let Traefik handle HTTPS automatically.
+A warning gives you half the points; a failure gives zero. A detailed report is also saved on the server at `/root/vps-harden-report-<date>.txt`. Running it weekly (or on a schedule) is a good habit.
 
 ---
 
-## A few honest caveats
+## Quick reference: the commands you'll actually use
 
-- This is a **baseline**, not a guarantee. It dramatically reduces your attack surface but it isn't a substitute for ongoing patching, good app-level security, off-site backups, and monitoring.
-- Re-run `--audit-only` periodically (a weekly cron is a good idea) so a creeping pile of pending updates or a service that died doesn't quietly drag your score down.
-- Grab the latest version anytime with `git pull` inside the cloned `vps-harden` directory.
-- Always read a script before running it as root — including this one. Every section is commented for exactly that reason.
-- The script targets Ubuntu/Debian. It will warn but not stop on other distros; behaviour there is untested.
+All of these run **on the server**:
 
-Harden first, deploy second. Your future self — and your apps — will thank you.
+| Command | What it does |
+|---------|--------------|
+| `sudo ./vps-harden.sh` | The normal run — asks you questions, secures everything |
+| `sudo ./vps-harden.sh --audit-only` | Just check the score, change nothing |
+| `sudo ./vps-harden.sh --no-dokploy` | Secure the server but skip Dokploy |
+| `sudo ./vps-harden.sh --help` | Show the help text |
+| `git pull` | Get the newest version of the script later (run inside the `vps-harden` folder) |
+
+---
+
+## A few honest words before you go
+
+- This script is a **strong starting point**, not a force field. Keep your apps updated, make backups, and don't reuse passwords.
+- You can always read the script before running it — it's all commented in plain language, and reading code you're about to run as root is a great habit.
+- It's built and tested for Ubuntu/Debian. On other systems it'll warn you, and results aren't guaranteed.
+
+Secure the house before you move the furniture in. Harden first, deploy second — your future self will thank you.

@@ -240,7 +240,7 @@ EOF
   if sshd -t 2>/dev/null; then
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
     ok "SSH hardened (port $SSH_PORT, root login off, password auth $([[ "$can_disable_pw" == "yes" ]] && echo disabled || echo kept))"
-    warn "Keep your current session open. Test a NEW login before closing it:"
+    warn "Keep this window open. From your LAPTOP, test a NEW login before closing it:"
     echo "    ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>"
   else
     err "sshd config test failed - reverting."
@@ -263,9 +263,9 @@ do_firewall() {
     ufw allow 80/tcp   comment 'HTTP (Traefik)'
     ufw allow 443/tcp  comment 'HTTPS (Traefik)'
     ufw allow 443/udp  comment 'HTTP/3 (Traefik)'
-    warn "Dokploy panel runs on port 3000. Leave it CLOSED in UFW and reach it via SSH tunnel:"
-    echo "    ssh -p ${SSH_PORT} -L 3000:localhost:3000 ${NEW_USER:-root}@<server-ip>"
-    echo "    then open http://localhost:3000"
+    warn "Dokploy panel runs on port 3000. Leave it CLOSED in UFW and reach it from your LAPTOP via SSH tunnel:"
+    echo "    ssh -p ${SSH_PORT} ${NEW_USER:-root}@<server-ip> -L 3000:localhost:3000"
+    echo "    then open http://localhost:3000 in your laptop's browser"
   fi
 
   ufw --force enable
@@ -476,7 +476,7 @@ main() {
 
   echo
   warn "This will modify SSH, firewall and system settings."
-  warn "Keep your current SSH session OPEN and test a new login before disconnecting."
+  warn "Keep THIS window open. After it finishes, test a new login from your LAPTOP before disconnecting."
   confirm "Continue with hardening?" || { log "Aborted."; exit 0; }
 
   do_update
@@ -490,13 +490,20 @@ main() {
   run_audit
 
   hr
-  ok "Done."
-  echo "Next steps:"
-  echo "  1. In a NEW terminal: ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>"
-  echo "  2. Confirm you can log in, THEN close this session."
-  [[ "$INSTALL_DOKPLOY" == "yes" ]] && \
-    echo "  3. Reach Dokploy via tunnel: ssh -p ${SSH_PORT} -L 3000:localhost:3000 ${NEW_USER:-root}@<server-ip>  ->  http://localhost:3000"
-  echo "  Re-audit anytime: sudo ./vps-harden.sh --audit-only"
+  ok "Done. Your server has been hardened."
+  echo
+  echo "${BLD}>>> IMPORTANT: do this BEFORE closing this window <<<${NC}"
+  echo "On your LAPTOP, open a NEW terminal window and test the new login:"
+  echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>${NC}"
+  echo "  - If it works: you can safely close THIS window. You're done."
+  echo "  - If it fails: keep THIS window open and fix it here."
+  [[ "$INSTALL_DOKPLOY" == "yes" ]] && {
+    echo
+    echo "To open Dokploy, run this on your LAPTOP, then visit http://localhost:3000 :"
+    echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-root}@<server-ip> -L 3000:localhost:3000${NC}"
+  }
+  echo
+  echo "Re-check your security score anytime:  sudo ./vps-harden.sh --audit-only"
 }
 
 main "$@"
