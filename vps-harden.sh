@@ -27,6 +27,7 @@
 #
 # Configure with environment variables (or answer the prompts):
 #   NEW_USER=deploy
+#   NEW_USER_PASSWORD=...          (blank => prompt, or auto-generated under --yes)
 #   SSH_PORT=2222                 (or "auto" to pick a free high port)
 #   SSH_PUBKEY="ssh-ed25519 AAAA... you@host"
 #   INSTALL_DOKPLOY=yes|no
@@ -70,6 +71,11 @@ SSH_PORT="${SSH_PORT:-22}"
 SSH_PUBKEY="${SSH_PUBKEY:-}"
 INSTALL_DOKPLOY="${INSTALL_DOKPLOY:-}"
 GENERATED_KEY_FILE=""
+
+# Password for the new user. Empty => prompt (interactive) or generate (--yes).
+# Set NEW_USER_PASSWORD in the environment to choose your own.
+NEW_USER_PASSWORD="${NEW_USER_PASSWORD:-}"
+USER_PASSWORD_GENERATED="no"
 
 # Container ports that should stay reachable from the internet once ufw-docker
 # starts filtering. 80/443 by default: this box is meant to serve web traffic,
@@ -175,6 +181,25 @@ ask() {
   echo "${reply:-$default}"
 }
 
+ask_secret() {
+  # ask_secret "prompt" -> echoes a hidden-input answer ("" under --yes)
+  local prompt="$1" reply
+  [[ "$ASSUME_YES" == "yes" ]] && { echo ""; return; }
+  read -r -s -p "${BLU}[?]${NC} $prompt: " reply
+  echo >&2   # newline after the hidden input
+  echo "$reply"
+}
+
+gen_password() {
+  # A strong, shell-safe password: 20 chars, no symbols to trip up copy/paste.
+  local p=""
+  if command -v openssl >/dev/null 2>&1; then
+    p="$(openssl rand -base64 32 | tr -dc 'A-Za-z0-9' | head -c 20)"
+  fi
+  [[ -z "$p" ]] && p="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 20)"
+  printf '%s' "$p"
+}
+
 # ----------------------------------------------------------------------------
 # Pre-flight
 # ----------------------------------------------------------------------------
@@ -258,11 +283,32 @@ do_user() {
   printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$NEW_USER" >"$sudoers"
   chmod 440 "$sudoers"
   if visudo -cf "$sudoers" >/dev/null 2>&1; then
-    ok "Granted '$NEW_USER' passwordless sudo"
+    ok "Granted '$NEW_USER' passwordless sudo (so automation + the CLI work)"
   else
     rm -f "$sudoers"
     err "sudoers rule failed its syntax check - not installed."
     err "Do NOT close this session: '$NEW_USER' cannot reach root yet."
+  fi
+
+  # Give the user an actual password as well.
+  #
+  # The NOPASSWD rule above is what fixes the lockout for automation, but with
+  # SSH about to become key-only, a lost key would still leave you stranded. A
+  # real password is your recovery route: the provider's web console logs in
+  # with a password even when SSH won't. This password is NOT accepted for SSH
+  # (that stays key-only) — only for the console and `su`.
+  if [[ -z "$NEW_USER_PASSWORD" ]]; then
+    NEW_USER_PASSWORD="$(ask_secret "Set a password for '$NEW_USER' (blank = generate a strong one)")"
+  fi
+  if [[ -z "$NEW_USER_PASSWORD" ]]; then
+    NEW_USER_PASSWORD="$(gen_password)"
+    USER_PASSWORD_GENERATED="yes"
+  fi
+  if echo "${NEW_USER}:${NEW_USER_PASSWORD}" | chpasswd 2>/dev/null; then
+    ok "Set a password for '$NEW_USER' (console / recovery login)"
+  else
+    warn "Could not set a password for '$NEW_USER' — set one later with: sudo passwd $NEW_USER"
+    NEW_USER_PASSWORD=""
   fi
 
   if [[ -z "$SSH_PUBKEY" ]]; then
@@ -728,6 +774,21 @@ main() {
   hr
   ok "Done. Your server has been hardened."
   echo
+
+  # Show the account password. If we generated it, this is the ONLY time it's
+  # shown — it's the recovery route if the SSH key is ever lost.
+  if [[ "$USER_PASSWORD_GENERATED" == "yes" && -n "$NEW_USER_PASSWORD" ]]; then
+    echo "${BLD}>>> SAVE THIS: recovery password for '${NEW_USER}' <<<${NC}"
+    echo "    ${BLD}${NEW_USER_PASSWORD}${NC}"
+    echo "    Use it to log in via your provider's web console if you lose your SSH key."
+    echo "    (It is NOT used for SSH — that stays key-only.)"
+    echo
+  elif [[ -n "$NEW_USER_PASSWORD" ]]; then
+    echo "The password you set for '${NEW_USER}' works for console / recovery login."
+    echo "(SSH stays key-only — the password is not accepted for SSH.)"
+    echo
+  fi
+
   if [[ -n "$GENERATED_KEY_FILE" ]]; then
     echo "${BLD}>>> FIRST: copy your private key to your laptop (if you haven't) <<<${NC}"
     echo "On your LAPTOP:"
