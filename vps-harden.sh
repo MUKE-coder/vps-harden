@@ -23,12 +23,15 @@
 #   sudo ./vps-harden.sh --audit-only    # just score, change nothing
 #   sudo ./vps-harden.sh --no-dokploy    # harden but skip Dokploy
 #   sudo ./vps-harden.sh --yes           # non-interactive (uses env vars / defaults)
+#   sudo ./vps-harden.sh --auto-port     # move SSH to a random free high port
 #
 # Configure with environment variables (or answer the prompts):
 #   NEW_USER=deploy
-#   SSH_PORT=2222
+#   SSH_PORT=2222                 (or "auto" to pick a free high port)
 #   SSH_PUBKEY="ssh-ed25519 AAAA... you@host"
 #   INSTALL_DOKPLOY=yes|no
+#   DOCKER_PUBLIC_PORTS="80 443"  published container ports to keep reachable
+#                                 once ufw-docker starts filtering them
 #
 # License: MIT. No warranty. Read it before you run it.
 # ----------------------------------------------------------------------------
@@ -68,6 +71,18 @@ SSH_PUBKEY="${SSH_PUBKEY:-}"
 INSTALL_DOKPLOY="${INSTALL_DOKPLOY:-}"
 GENERATED_KEY_FILE=""
 
+# Container ports that should stay reachable from the internet once ufw-docker
+# starts filtering. 80/443 by default: this box is meant to serve web traffic,
+# and blocking those would break the very thing you are deploying. Anything else
+# (a dashboard on 8080, a database, ...) must be opted in.
+#
+# These are CONTAINER ports, not published host ports. The rule is matched after
+# Docker's DNAT, so `ufw route allow ... port 80` lets through ANY container
+# serving on 80 no matter which host port it is published on. Verified on a real
+# box: redis published as -p 6379:6379 was refused from the internet, while
+# Traefik on 80/443 and Orbita on 8080 kept working.
+DOCKER_PUBLIC_PORTS="${DOCKER_PUBLIC_PORTS:-80 443}"
+
 # ----------------------------------------------------------------------------
 # Arg parsing
 # ----------------------------------------------------------------------------
@@ -75,6 +90,7 @@ for arg in "$@"; do
   case "$arg" in
     --audit-only) AUDIT_ONLY="yes" ;;
     --no-dokploy) INSTALL_DOKPLOY="no" ;;
+    --auto-port)  SSH_PORT="auto" ;;
     --yes|-y)     ASSUME_YES="yes" ;;
     --help|-h)
       grep '^#' "$0" | sed 's/^#\s\?//' | head -n 40
@@ -98,6 +114,36 @@ sshd_effective() {
   local key="$1" out
   out="$(sshd -T 2>/dev/null || true)"
   awk -v k="$key" '$1 == k { v = $2 } END { if (v != "") print v }' <<<"$out"
+}
+
+# Pick a random unused high port for SSH (SSH_PORT=auto).
+#
+# Deliberately not the default: moving SSH is only safe if you can still reach
+# the new port. Some providers filter non-standard ports at their own edge, and
+# a box you cannot log into is worse than one on port 22. Opt in with
+# SSH_PORT=auto or --auto-port.
+pick_free_port() {
+  local p listening
+  listening="$(ss -ltnH 2>/dev/null || true)"
+  for _ in $(seq 1 50); do
+    p=$(( (RANDOM % 40000) + 20000 ))
+    case "$listening" in
+      *":$p "*) continue ;;
+      *) printf '%s' "$p"; return 0 ;;
+    esac
+  done
+  printf '22'   # gave up; caller keeps the default rather than guessing
+}
+
+# Allow a PUBLISHED CONTAINER port through UFW.
+#
+# Once ufw-docker is installed, `ufw allow <port>` is not enough: Docker's
+# traffic is forwarded, not INPUT, so it needs a `ufw route` rule. Verified on a
+# real box — with ufw-docker installed, `ufw allow 8080/tcp` left the port dead
+# (HTTP 000) while `ufw route allow ... port 8080` brought it back (HTTP 200).
+allow_docker_port() {
+  local port="$1"
+  ufw route allow proto tcp from any to any port "$port" >/dev/null 2>&1 || true
 }
 
 audit() {
@@ -284,7 +330,24 @@ do_user() {
 do_ssh() {
   hr; log "Hardening SSH"
 
-  [[ "$SSH_PORT" == "22" ]] && SSH_PORT="$(ask 'SSH port to use (non-default recommended)' '22')"
+  [[ "$SSH_PORT" == "22" ]] && SSH_PORT="$(ask 'SSH port to use (non-default recommended, or "auto")' '22')"
+
+  # SSH_PORT=auto / --auto-port: let the script choose a free high port.
+  if [[ "$SSH_PORT" == "auto" ]]; then
+    SSH_PORT="$(pick_free_port)"
+    if [[ "$SSH_PORT" == "22" ]]; then
+      warn "Could not find a free high port; staying on 22."
+    else
+      ok "Chose SSH port $SSH_PORT"
+      warn "WRITE THIS DOWN. From now on you must connect with: ssh -p $SSH_PORT ${NEW_USER:-<user>}@<server-ip>"
+      warn "If your provider filters non-standard ports at their edge, open $SSH_PORT there too."
+    fi
+  fi
+
+  if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
+    err "Invalid SSH port '$SSH_PORT' - staying on 22."
+    SSH_PORT=22
+  fi
 
   local can_disable_pw="yes"
   local home; home="$(eval echo "~${NEW_USER:-root}")"
@@ -386,6 +449,8 @@ do_firewall() {
     ufw allow 80/tcp   comment 'HTTP (Traefik)'
     ufw allow 443/tcp  comment 'HTTPS (Traefik)'
     ufw allow 443/udp  comment 'HTTP/3 (Traefik)'
+    # Traefik runs in a container, so these also need route rules below.
+    DOCKER_PUBLIC_PORTS="$DOCKER_PUBLIC_PORTS 80 443"
     warn "Dokploy panel runs on port 3000. Leave it CLOSED in UFW and reach it from your LAPTOP via SSH tunnel:"
     echo "    ssh -p ${SSH_PORT} ${NEW_USER:-root}@<server-ip> -L 3000:localhost:3000"
     echo "    then open http://localhost:3000 in your laptop's browser"
@@ -395,20 +460,47 @@ do_firewall() {
   ok "UFW enabled"
 
   # --- Docker bypasses UFW. Fix it. ---
-  # Docker writes its own iptables rules and ignores UFW, exposing any
-  # published container port to the world. ufw-docker closes that gap.
-  if command -v docker >/dev/null 2>&1 || [[ "${INSTALL_DOKPLOY}" == "yes" ]]; then
-    log "Applying Docker<->UFW fix (ufw-docker)"
-    if [[ ! -f /usr/local/bin/ufw-docker ]]; then
-      curl -fsSL -o /usr/local/bin/ufw-docker \
-        https://raw.githubusercontent.com/chaifeng/ufw-docker/master/ufw-docker 2>/dev/null && \
-        chmod +x /usr/local/bin/ufw-docker || warn "Could not fetch ufw-docker; do it manually later."
+  #
+  # Docker writes its own iptables rules ahead of UFW's, so ANY published
+  # container port is world-reachable no matter what UFW says. Measured on a
+  # real box: UFW allowed port 22 only, and http://<ip>:8080 still answered 200.
+  # ufw-docker closes that gap.
+  #
+  # This used to be gated on `command -v docker`, which meant it almost never
+  # ran: you harden a fresh VPS first and install Docker afterwards, so at this
+  # point Docker isn't there yet and the fix was skipped forever. ufw-docker
+  # only edits /etc/ufw/after.rules, so installing it before Docker exists is
+  # fine — the rules simply take effect once Docker shows up.
+  log "Applying Docker<->UFW fix (ufw-docker)"
+  if [[ ! -x /usr/local/bin/ufw-docker ]]; then
+    if curl -fsSL -o /usr/local/bin/ufw-docker \
+         https://raw.githubusercontent.com/chaifeng/ufw-docker/master/ufw-docker 2>/dev/null; then
+      chmod +x /usr/local/bin/ufw-docker
+    else
+      warn "Could not fetch ufw-docker; published container ports will bypass UFW."
     fi
-    if [[ -x /usr/local/bin/ufw-docker ]]; then
-      /usr/local/bin/ufw-docker install >/dev/null 2>&1 || true
-      systemctl restart ufw 2>/dev/null || true
-      ok "Docker traffic now respects UFW (published ports are no longer auto-exposed)"
-    fi
+  fi
+
+  if [[ -x /usr/local/bin/ufw-docker ]]; then
+    /usr/local/bin/ufw-docker install >/dev/null 2>&1 || true
+    systemctl restart ufw 2>/dev/null || true
+
+    # ufw-docker blocks EVERY published port by default, and `ufw allow <port>`
+    # does not undo that — container traffic is forwarded, not INPUT, so it
+    # needs a `ufw route` rule. Without this a hardened box silently black-holes
+    # its own web server: verified on a real box, Traefik's port went from 200
+    # to unreachable the moment ufw-docker was installed.
+    local p
+    for p in $DOCKER_PUBLIC_PORTS; do
+      allow_docker_port "$p"
+    done
+    ufw reload >/dev/null 2>&1 || true
+
+    ok "Docker traffic now respects UFW"
+    ok "Container ports reachable from the internet: ${DOCKER_PUBLIC_PORTS:-none}"
+    warn "Any OTHER container port is now refused from the internet (databases included)."
+    warn "These are container ports, not published host ports. To open one:"
+    echo "    sudo ufw route allow proto tcp from any to any port <CONTAINER_PORT>"
   fi
 }
 
