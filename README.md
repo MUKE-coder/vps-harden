@@ -72,6 +72,7 @@ The script asks you a few easy questions:
 - **An SSH key** — here you have two choices:
   - If you've never made one, **just leave it blank and press Enter** → the script makes a key *for you*. ⭐ (recommended for beginners)
   - If you already have a key on your laptop, paste your public key instead.
+- **A password** for the account — leave it blank and the script generates a strong one and **prints it at the end**. Save it: SSH stays key-only, but this password lets you log in through your provider's **web console** if you ever lose the key.
 - **Install Dokploy?** — type `y` for yes or `n` for no.
 
 ### Step 4 — If the script made a key for you: save it to your laptop ☁️ ➜ 💻
