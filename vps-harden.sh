@@ -86,6 +86,20 @@ done
 # ----------------------------------------------------------------------------
 # Audit helpers
 # ----------------------------------------------------------------------------
+# Read one effective value out of `sshd -T`, e.g. sshd_effective permitrootlogin
+#
+# Do NOT write this as `x="$(sshd -T | awk '/^port /{print $2; exit}')"`. awk's
+# `exit` closes the pipe, sshd -T is killed by SIGPIPE, `set -o pipefail` makes
+# the pipeline non-zero, and `set -e` then kills the script on what looks like a
+# harmless assignment. That is exactly what used to abort the audit silently,
+# right after the password-auth check and before it could print a score. The
+# checks above it survived only because `if <cmd>` suppresses set -e.
+sshd_effective() {
+  local key="$1" out
+  out="$(sshd -T 2>/dev/null || true)"
+  awk -v k="$key" '$1 == k { v = $2 } END { if (v != "") print v }' <<<"$out"
+}
+
 audit() {
   # audit "<weight>" "<name>" "pass|warn|fail" "<message>"
   local weight="$1" name="$2" status="$3" msg="$4" color tag
@@ -183,6 +197,28 @@ do_user() {
   fi
   usermod -aG sudo "$NEW_USER"
 
+  # Being in the sudo group is not enough to be able to USE sudo.
+  #
+  # The account is created with --disabled-password, so it has no password to
+  # type at sudo's prompt — every attempt fails with "sudo: a password is
+  # required". do_ssh() then sets PermitRootLogin no. The combination leaves a
+  # box with no route to root at all: sudo rejects you, and `su` wants a root
+  # password that a key-only VPS (Hetzner, DigitalOcean, ...) never had. The
+  # only way back in is the provider's rescue console.
+  #
+  # Ubuntu's own cloud images grant their default user exactly this rule, in
+  # /etc/sudoers.d/90-cloud-init-users, for precisely this reason.
+  local sudoers="/etc/sudoers.d/90-${NEW_USER}"
+  printf '%s ALL=(ALL) NOPASSWD:ALL\n' "$NEW_USER" >"$sudoers"
+  chmod 440 "$sudoers"
+  if visudo -cf "$sudoers" >/dev/null 2>&1; then
+    ok "Granted '$NEW_USER' passwordless sudo"
+  else
+    rm -f "$sudoers"
+    err "sudoers rule failed its syntax check - not installed."
+    err "Do NOT close this session: '$NEW_USER' cannot reach root yet."
+  fi
+
   if [[ -z "$SSH_PUBKEY" ]]; then
     echo
     warn "No SSH key was provided."
@@ -258,8 +294,37 @@ do_ssh() {
   fi
 
   install -d -m 755 /etc/ssh/sshd_config.d
-  cat >/etc/ssh/sshd_config.d/99-hardening.conf <<EOF
+
+  # The file name is load-bearing. sshd_config takes the FIRST occurrence of a
+  # keyword, and `Include /etc/ssh/sshd_config.d/*.conf` sits at the top of the
+  # main config and pulls files in ALPHABETICAL order. Ubuntu cloud images ship
+  #
+  #     50-cloud-init.conf:  PasswordAuthentication yes
+  #
+  # so a file named 99-* is read last and silently loses every conflict. This
+  # script used to write 99-hardening.conf and then report "password auth
+  # disabled" while `sshd -T` still said `passwordauthentication yes`. 00-
+  # sorts first, so our settings actually win — including after cloud-init
+  # regenerates its own file on a later boot.
+  local conf=/etc/ssh/sshd_config.d/00-hardening.conf
+  rm -f /etc/ssh/sshd_config.d/99-hardening.conf   # written by older versions
+
+  # Belt and braces: neutralise conflicting directives the image left behind so
+  # that `sshd -T` and a human reading the directory tell the same story.
+  local other
+  for other in /etc/ssh/sshd_config.d/*.conf; do
+    [[ -f "$other" && "$other" != "$conf" ]] || continue
+    if grep -qE '^[[:space:]]*(PasswordAuthentication|PermitRootLogin)\b' "$other"; then
+      [[ -f "$other.vps-harden.bak" ]] || cp -p "$other" "$other.vps-harden.bak"
+      sed -ri 's/^([[:space:]]*)(PasswordAuthentication|PermitRootLogin)\b/#\1\2/' "$other"
+      ok "Neutralised conflicting directives in $(basename "$other") (backup kept)"
+    fi
+  done
+
+  cat >"$conf" <<EOF
 # Managed by vps-harden.sh ($TIMESTAMP)
+# Named 00- on purpose: sshd uses the FIRST value it sees for a keyword, and
+# this directory is Included alphabetically. Do not rename this to 99-.
 Port ${SSH_PORT}
 Protocol 2
 PermitRootLogin no
@@ -281,12 +346,28 @@ EOF
 
   if sshd -t 2>/dev/null; then
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-    ok "SSH hardened (port $SSH_PORT, root login off, password auth $([[ "$can_disable_pw" == "yes" ]] && echo disabled || echo kept))"
+
+    # Report what sshd ACTUALLY ended up doing, not what we asked for. The old
+    # message printed our intent, which is how the 99-* precedence bug above
+    # survived: it cheerfully said "password auth disabled" on a box that had
+    # it enabled.
+    local eff_pw eff_root eff_port
+    eff_pw="$(sshd_effective passwordauthentication)"
+    eff_root="$(sshd_effective permitrootlogin)"
+    eff_port="$(sshd_effective port)"
+    ok "SSH hardened (port ${eff_port:-$SSH_PORT}, root login ${eff_root:-unknown}, password auth ${eff_pw:-unknown})"
+
+    if [[ "$can_disable_pw" == "yes" && "$eff_pw" == "yes" ]]; then
+      err "Asked sshd to disable password auth, but it is still enabled."
+      err "Something in /etc/ssh/sshd_config.d/ or sshd_config overrides us; check: sshd -T | grep -i password"
+    fi
+
     warn "Keep this window open. From your LAPTOP, test a NEW login before closing it:"
-    echo "    ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>"
+    echo "    ssh -p ${eff_port:-$SSH_PORT} ${NEW_USER:-<user>}@<server-ip>"
   else
     err "sshd config test failed - reverting."
-    rm -f /etc/ssh/sshd_config.d/99-hardening.conf
+    rm -f "$conf"
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
   fi
 }
 
@@ -430,17 +511,23 @@ run_audit() {
   echo; echo "${BLD}Security checks${NC}"; hr
 
   # SSH root login
-  if sshd -T 2>/dev/null | grep -qi '^permitrootlogin no'; then
+  #
+  # Compare the value instead of `sshd -T | grep -q`: grep exits as soon as it
+  # matches, sshd -T then dies of SIGPIPE, and `set -o pipefail` turns the whole
+  # pipeline non-zero — so a *correctly* hardened box was reported as FAIL. It
+  # only bit the keys that appear early in sshd -T's output, which is why root
+  # login failed while password auth (further down) passed.
+  if [[ "$(sshd_effective permitrootlogin)" == "no" ]]; then
     audit 10 "SSH root login" pass "Root login disabled"
   else audit 10 "SSH root login" fail "Root login still permitted"; fi
 
   # SSH password auth
-  if sshd -T 2>/dev/null | grep -qi '^passwordauthentication no'; then
+  if [[ "$(sshd_effective passwordauthentication)" == "no" ]]; then
     audit 10 "SSH password auth" pass "Password auth disabled (keys only)"
   else audit 10 "SSH password auth" warn "Password authentication still enabled"; fi
 
   # SSH port
-  local port; port="$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}')"
+  local port; port="$(sshd_effective port)"
   if [[ "$port" != "22" ]]; then audit 5 "SSH port" pass "Non-default port ($port)"
   else audit 5 "SSH port" warn "Using default port 22"; fi
 
@@ -459,7 +546,15 @@ run_audit() {
   else audit 10 "Auto security updates" warn "Not enabled"; fi
 
   # Pending updates
-  local upd; upd="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || echo 0)"
+  #
+  # `grep -c` PRINTS "0" and exits 1 when it finds nothing, so `|| echo 0`
+  # appended a second zero and upd became "0\n0" — which blew up the arithmetic
+  # test below with `[[: 0\n0: syntax error` and scored the check as FAIL on a
+  # fully up-to-date box. Swallow the status, don't add another value.
+  local upd
+  upd="$(apt-get -s upgrade 2>/dev/null | grep -c '^Inst' || true)"
+  upd="${upd//[^0-9]/}"
+  upd="${upd:-0}"
   if [[ "$upd" -eq 0 ]]; then audit 10 "Pending updates" pass "System up to date"
   elif [[ "$upd" -lt 10 ]]; then audit 10 "Pending updates" warn "$upd updates pending"
   else audit 10 "Pending updates" fail "$upd updates pending"; fi
@@ -469,8 +564,15 @@ run_audit() {
   else audit 5 "Kernel hardening" warn "No sysctl hardening profile"; fi
 
   # Non-root sudo user
-  if [[ -n "$NEW_USER" ]] && id "$NEW_USER" >/dev/null 2>&1; then
+  #
+  # --audit-only runs with NEW_USER unset, so trusting the variable reported
+  # "no dedicated sudo user" on a box that had one. Look at the sudo group.
+  local sudo_users
+  sudo_users="$(getent group sudo 2>/dev/null | awk -F: '{gsub(/,/, " ", $4); print $4}')"
+  if [[ -n "${NEW_USER:-}" ]] && id "$NEW_USER" >/dev/null 2>&1; then
     audit 5 "Non-root sudo user" pass "'$NEW_USER' exists"
+  elif [[ -n "${sudo_users// /}" ]]; then
+    audit 5 "Non-root sudo user" pass "sudo group:${sudo_users}"
   else audit 5 "Non-root sudo user" warn "No dedicated sudo user detected"; fi
 
   # Docker / UFW fix
