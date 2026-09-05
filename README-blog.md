@@ -75,37 +75,104 @@ sudo ./vps-harden.sh
 It'll ask you some simple questions:
 
 - **A username** for your everyday account — keep it simple, like `deploy`.
-- **An SSH port** — just press Enter to take the suggestion.
+  ⚠️ **Write down exactly what you type.** Everything later is named after it —
+  choose `dev` and your key file is `dev_key`, and you log in as `dev@...`, not
+  `deploy@...`.
+- **An SSH port** — press Enter to stay on the normal port 22. If you type
+  anything else (or `auto`), **write it down**: from then on every `ssh` and
+  `scp` needs `-p THAT-PORT`. The script prints it in a box at the end and saves
+  it to `/root/vps-harden-login.txt`, so it's recoverable if you miss it.
 - **An SSH key** — this is the part beginners dread, but you have an easy way out:
   - **Never made a key? Just leave it blank and press Enter.** ⭐ The script generates one for you automatically and tells you exactly what to do next. This is the recommended path.
   - Already have a key on your laptop? Paste your public key instead.
 - **Install Dokploy?** — `y` for yes, `n` for no.
 
-The script then works for a few minutes and finishes by showing your security score.
+The script then works for a few minutes and finishes by showing your security
+score, your login details, and — if it made one for you — your private key.
+**Don't close that window until you've finished Step 5.**
 
-### Step 4 — Save your key to your laptop (only if the script made one) ☁️ ➜ 💻
+### Step 4 — Get your private key onto your laptop ☁️ ➜ 💻
 
-If you left the key blank, the script created a fresh key pair *on the server* and printed instructions. The **private key** is now sitting on the server, and you need to bring it down to your laptop — it's your only way to log back in.
+> 🚩 **Stop and read this.** Every example below says `deploy`, because that's
+> the username *we* picked. **The script names your files after the username
+> YOU typed.** If you typed `dev`, your key is `dev_key` and your login is
+> `dev@...`, and pasting `deploy_key` will fail with *"No such file or
+> directory"*. This is the number one place people get stuck.
 
-Open a **new terminal window on your laptop** 💻 (leave the server one open!) and run the command the script showed you. It looks like this:
+If you left the key blank in Step 3, the script created a key pair *on the
+server*. The **private** half needs to come down to your laptop — it's your only
+way to log back in.
+
+The script prints the whole key on screen at the end of its run. Scroll up in
+your terminal to the block that starts:
+
+```
+>>> YOUR PRIVATE KEY - COPY THIS TO YOUR LAPTOP NOW <<<
+```
+
+Select everything from `-----BEGIN OPENSSH PRIVATE KEY-----` through
+`-----END OPENSSH PRIVATE KEY-----` — including both of those lines — and copy
+it. Then, on your **laptop** 💻, save it into a file.
+
+**Mac, Linux, or Windows with Git Bash / WSL:**
 
 ```bash
-scp root@YOUR-SERVER-IP:/root/vps-harden-keys/deploy_key ~/.ssh/deploy_key
+mkdir -p ~/.ssh
+nano ~/.ssh/deploy_key      # paste, then Ctrl+O, Enter, Ctrl+X
 chmod 600 ~/.ssh/deploy_key
 ```
 
-`scp` is "secure copy" — it pulls the file from the server to your laptop. The `chmod 600` line tells your laptop "this is a private key, keep it locked down," which SSH insists on. (`deploy` will be whatever username you picked.)
+`chmod 600` tells your laptop "this is a private key, keep it locked down" —
+SSH refuses to use a key that anyone else on the machine can read.
 
-> If you pasted your own existing key in Step 3, you can skip this step entirely — your key is already on your laptop.
+**Windows with PowerShell:** there is no `chmod` on Windows, so use `icacls`:
+
+```powershell
+mkdir $HOME\.ssh -Force
+notepad $HOME\.ssh\deploy_key    # paste, then save and close
+icacls $HOME\.ssh\deploy_key /inheritance:r /grant:r "$env:USERNAME:R"
+```
+
+> **What about `scp`?** You *can* download the key as a file, but only **while
+> the script is still running**, during the pause right after it makes the key:
+> `scp root@YOUR-SERVER-IP:/root/vps-harden-keys/deploy_key ~/.ssh/deploy_key`.
+> Once the script has finished, that command can no longer work — it has just
+> disabled root SSH login and possibly moved the port. Copy/paste from your
+> terminal always works, so that's the path we recommend.
+
+> If you pasted your own existing key in Step 3, skip this step entirely — your
+> key is already on your laptop.
 
 ### Step 5 — ⚠️ Test the new login BEFORE you close anything ⚠️
 
-This is the step you must not skip. The script changed how you log in (new user, new port, key instead of password). You need to **prove the new login works while you still have a way back in**. Locking yourself out of a remote server is the classic beginner disaster, and it's completely avoidable.
+This is the step you must not skip. The script changed how you log in (new user,
+maybe a new port, key instead of password). You need to **prove the new login
+works while you still have a way back in**. Locking yourself out of a remote
+server is the classic beginner disaster, and it's completely avoidable.
 
-Here's the safe way:
+First, collect the **three facts** you need. The script prints them in a box at
+the very end:
+
+```
+    +--------------------------------------------------+
+    |  SERVER   : 203.0.113.77                         |
+    |  USERNAME : deploy                               |
+    |  SSH PORT : 22                                   |
+    +--------------------------------------------------+
+```
+
+Missed it, or already scrolled past? They're saved on the server. Run either of
+these **on the server** ☁️:
+
+```bash
+sudo cat /root/vps-harden-login.txt        # IP, username, port, key location
+cd ~/vps-harden && sudo ./vps-harden.sh --info
+```
+
+Now, the safe way to test:
 
 1. **Keep your original server window open.** Don't close it.
-2. In the **new laptop terminal** 💻, try logging in the new way. The script prints the exact command — it'll be one of these:
+2. In a **new laptop terminal** 💻, try logging in the new way:
 
 ```bash
 # If the script generated a key for you:
@@ -115,9 +182,12 @@ ssh -i ~/.ssh/deploy_key -p YOUR-SSH-PORT deploy@YOUR-SERVER-IP
 ssh -p YOUR-SSH-PORT deploy@YOUR-SERVER-IP
 ```
 
-- ✅ **If you get in:** perfect. You're done — close the old window whenever you like. Your server is secured.
-- ❌ **If it fails:** stay calm and switch back to your **still-open** original window. You never lost access. Investigate, or just re-run the script. *This is exactly why we kept it open.*
+Replace `deploy` with **your** username, `YOUR-SSH-PORT` with the port from the
+box, and `YOUR-SERVER-IP` with your IP. On PowerShell, write
+`$HOME\.ssh\deploy_key` instead of `~/.ssh/deploy_key`.
 
+- ✅ **If you get in:** perfect. You're done — close the old window whenever you like. Your server is secured.
+- ❌ **If it fails:** stay calm and switch back to your **still-open** original window. You never lost access. Run `sudo ./vps-harden.sh --info` there to check the port and username you actually have, then try again. *This is exactly why we kept it open.*
 ---
 
 ## Opening the Dokploy dashboard (if you installed it)
@@ -167,8 +237,6 @@ Aim for an **A (90+)**. Each item is scored:
 | Docker firewall fix in place | 5 |
 
 A warning earns half the points; a failure earns zero. A full report is saved on the server at `/root/vps-harden-report-<date>.txt`. Running this weekly is a great habit.
-
----
 
 ---
 
@@ -224,8 +292,15 @@ Now you can SSH in normally with the new key. (If you never want to deal with th
 
 ### 🚪 "Permission denied (publickey)" when I try to log in
 
-SSH found your account but rejected your key. Common causes:
+SSH found your account but rejected your key. Common causes, most likely first:
 
+- **You copied `deploy` out of this guide but named your user something else.**
+  If you typed `dev`, you log in as `dev@IP` with `dev_key`. Confirm with
+  `ls /home` on the server.
+- **The key never actually reached your laptop.** If your `scp` printed *"No
+  such file or directory"*, it copied nothing — and the `chmod` on the next line
+  failed too. On your laptop, check: `ls -l ~/.ssh/`. Is the file there, and is
+  its size more than 0?
 - **Wrong key file.** Make sure you're pointing at the right one: `ssh -i ~/.ssh/deploy_key -p PORT deploy@IP`.
 - **Wrong permissions on your laptop.** SSH refuses keys that aren't locked down. Fix it on your laptop: `chmod 600 ~/.ssh/deploy_key`.
 - **Wrong username.** It's your created user (e.g. `deploy`), not `root` (root login is disabled on purpose).
@@ -242,7 +317,7 @@ SSH found your account but rejected your key. Common causes:
 Don't reinstall yet. Use the **provider's web console** (the VNC/rescue terminal in your dashboard) — it doesn't need SSH or a key, just your root password. Once inside, temporarily turn password login back on so you can get in normally and fix things:
 
 ```bash
-sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/99-hardening.conf
+sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/00-hardening.conf
 sudo systemctl restart ssh
 ```
 
@@ -254,14 +329,29 @@ Treat it as compromised, exactly like the stolen-laptop case: remove that key fr
 
 ### 🤔 I forgot my username / SSH port / what I chose
 
-From the web console (logged in as root):
+Get onto the server any way you can — a still-open window, or the provider's web
+console — and run:
+
+```bash
+cd ~/vps-harden && sudo ./vps-harden.sh --info
+```
+
+It reads the *live* configuration and prints your IP, your SSH port, your sudo
+users, and the exact `ssh` command for every key it generated. It works even
+when SSH is fully locked down.
+
+The same details are written to a file every run:
+
+```bash
+sudo cat /root/vps-harden-login.txt
+```
+
+Or check by hand:
 
 ```bash
 ls /home                                 # lists your usernames
 sudo sshd -T | grep -i '^port'           # shows the SSH port
 ```
-
-The script also saved a report at `/root/vps-harden-report-<date>.txt` you can read with `cat`.
 
 ### 🌐 Dokploy won't load at http://localhost:3000
 
@@ -280,9 +370,15 @@ sudo fail2ban-client set sshd unbanip YOUR-IP-ADDRESS
 
 Bans also expire on their own (24h for SSH by default).
 
-### 🔁 The script asks for a "sudo password" but I never set one
+### 🔁 `sudo` asks for a password I don't have
 
-The new user was created without a password and uses your key. If a command needs `sudo` and prompts for a password you don't have, set one from the web console (as root): `passwd deploy`.
+Current versions give your new user **passwordless sudo** *and* set a real
+account password, which is printed once at the end of the run and saved to
+`/root/vps-harden-login.txt`. If you're on an older run or lost it, set a new
+one from the web console as root: `passwd deploy`.
+
+That password is for the **web console and `su` only**. SSH stays key-only, so
+it won't get you in over SSH.
 
 ---
 
@@ -293,8 +389,11 @@ All of these run **on the server**:
 | Command | What it does |
 |---------|--------------|
 | `sudo ./vps-harden.sh` | Normal run — asks questions, secures everything |
+| `sudo ./vps-harden.sh --info` | **Forgot your port / username / key?** Prints them all |
 | `sudo ./vps-harden.sh --audit-only` | Just check the score, change nothing |
 | `sudo ./vps-harden.sh --no-dokploy` | Secure the server but skip Dokploy |
+| `sudo ./vps-harden.sh --auto-port` | Move SSH to a random free high port |
+| `sudo ./vps-harden.sh --yes` | Non-interactive; takes its answers from env vars |
 | `sudo ./vps-harden.sh --help` | Show help |
 | `git pull` | Get the newest version later (run inside the `vps-harden` folder) |
 

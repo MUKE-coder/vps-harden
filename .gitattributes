@@ -1,0 +1,8 @@
+# Shell scripts must keep LF endings no matter what platform commits them.
+# A vps-harden.sh checked out with CRLF dies on the server with a baffling
+# "bash: $'\r': command not found" on its very first line, and this repo is
+# routinely edited from Windows (where core.autocrlf=true is the default).
+*.sh text eol=lf
+
+# Docs are read on the server too (cat README.md over SSH).
+*.md text eol=lf

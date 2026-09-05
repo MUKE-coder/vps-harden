@@ -20,6 +20,7 @@
 # Usage:
 #   chmod +x vps-harden.sh
 #   sudo ./vps-harden.sh                 # interactive
+#   sudo ./vps-harden.sh --info          # "how do I log in?" - port, user, key
 #   sudo ./vps-harden.sh --audit-only    # just score, change nothing
 #   sudo ./vps-harden.sh --no-dokploy    # harden but skip Dokploy
 #   sudo ./vps-harden.sh --yes           # non-interactive (uses env vars / defaults)
@@ -60,7 +61,18 @@ hr()    { echo "${BLD}----------------------------------------------------------
 # ----------------------------------------------------------------------------
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 REPORT="/root/vps-harden-report-${TIMESTAMP}.txt"
+
+# Stable path on purpose (not timestamped): this is the file you tell a stranded
+# beginner to `cat` from the provider's web console. It holds the username, the
+# SSH port and the key path — the three things people lose.
+CREDS="/root/vps-harden-login.txt"
+
+# Where generated key pairs live. One definition: do_user writes here and
+# show_info reads here, and they must never drift apart.
+KEYDIR="/root/vps-harden-keys"
+
 AUDIT_ONLY="no"
+INFO_ONLY="no"
 ASSUME_YES="no"
 SCORE=0
 MAX_SCORE=0
@@ -95,11 +107,18 @@ DOCKER_PUBLIC_PORTS="${DOCKER_PUBLIC_PORTS:-80 443}"
 for arg in "$@"; do
   case "$arg" in
     --audit-only) AUDIT_ONLY="yes" ;;
+    --info|--login) INFO_ONLY="yes" ;;
     --no-dokploy) INSTALL_DOKPLOY="no" ;;
     --auto-port)  SSH_PORT="auto" ;;
     --yes|-y)     ASSUME_YES="yes" ;;
     --help|-h)
-      grep '^#' "$0" | sed 's/^#\s\?//' | head -n 40
+      # Print the header comment block, however long it grows: every comment
+      # line after the shebang, stopping at the first line that is not one.
+      # `head -n 40` used to hard-code a line count, so growing the header
+      # leaked the "Colours & logging" section into --help.
+      awk 'NR==1 { next }
+           /^#/  { sub(/^#[[:space:]]?/, ""); print; next }
+                 { exit }' "$0"
       exit 0 ;;
     *) err "Unknown option: $arg"; exit 1 ;;
   esac
@@ -200,6 +219,148 @@ gen_password() {
   printf '%s' "$p"
 }
 
+# The server's own public IP, so every command we print can be copy-pasted as-is.
+#
+# Printing "<server-ip>" placeholders is how beginners end up typing the literal
+# angle brackets, or pasting a command against the wrong box. Cached after the
+# first lookup because we print it many times.
+SERVER_IP=""
+detect_ip() {
+  if [[ -n "$SERVER_IP" ]]; then printf '%s' "$SERVER_IP"; return; fi
+  local ip=""
+  ip="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || ip="$(curl -fsS --max-time 5 https://ifconfig.me 2>/dev/null || true)"
+  [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || ip="<server-ip>"
+  SERVER_IP="$ip"
+  printf '%s' "$SERVER_IP"
+}
+
+# Print a generated private key to the terminal, with save instructions.
+#
+# This exists because scp is a trap. The key lives in /root, and by the time the
+# run finishes root SSH login is OFF and the port has moved — so the `scp
+# root@...` line older versions printed at the end could never work. Copy/paste
+# out of the terminal you are already sitting in always works, on every OS.
+print_private_key() {
+  local keyfile="$1" user="$2" port="$3" ip
+  # Windows paths need a literal backslash, which is painful to get right
+  # through the layers of quoting below. Hold it in a variable instead.
+  local bs='\'
+  ip="$(detect_ip)"
+  [[ -r "$keyfile" ]] || return 0
+  echo
+  hr
+  echo "${BLD}>>> YOUR PRIVATE KEY - COPY THIS TO YOUR LAPTOP NOW <<<${NC}"
+  hr
+  echo "Select EVERYTHING between the BEGIN and END lines below (including"
+  echo "those two lines) and copy it."
+  echo
+  cat "$keyfile"
+  echo
+  echo "${BLD}On your LAPTOP, save it:${NC}"
+  echo
+  echo "  ${BLD}Mac, Linux, or Windows Git Bash / WSL:${NC}"
+  echo "    mkdir -p ~/.ssh && nano ~/.ssh/${user}_key   # paste, Ctrl+O, Enter, Ctrl+X"
+  echo "    chmod 600 ~/.ssh/${user}_key"
+  echo
+  echo "  ${BLD}Windows PowerShell${NC} (there is no chmod there - Windows uses icacls):"
+  echo "    mkdir \$HOME${bs}.ssh -Force"
+  echo "    notepad \$HOME${bs}.ssh${bs}${user}_key          # paste, then save and close"
+  echo "    icacls \$HOME${bs}.ssh${bs}${user}_key /inheritance:r /grant:r \"\$env:USERNAME:R\""
+  echo
+  echo "${BLD}Then log in with:${NC}"
+  echo "    ${BLD}ssh -i ~/.ssh/${user}_key -p ${port} ${user}@${ip}${NC}"
+  echo "    (PowerShell: write \$HOME${bs}.ssh${bs}${user}_key instead of ~/.ssh/${user}_key)"
+  hr
+}
+
+# One file that answers "how do I get back in?" - written every run, stable path.
+write_credentials() {
+  local port="$1" ip
+  ip="$(detect_ip)"
+  {
+    echo "vps-harden login details  (generated $TIMESTAMP)"
+    echo "============================================================"
+    echo "Server IP   : $ip"
+    echo "Username    : ${NEW_USER:-<none created>}"
+    echo "SSH port    : $port"
+    echo "Private key : ${GENERATED_KEY_FILE:-<you supplied your own key>}"
+    if [[ -n "$NEW_USER_PASSWORD" ]]; then
+      echo "Password    : $NEW_USER_PASSWORD"
+      echo "              (console / su only - SSH is key-only)"
+    fi
+    echo
+    echo "Log in from your laptop with:"
+    if [[ -n "$GENERATED_KEY_FILE" ]]; then
+      echo "  ssh -i ~/.ssh/${NEW_USER}_key -p ${port} ${NEW_USER}@${ip}"
+    else
+      echo "  ssh -p ${port} ${NEW_USER:-<user>}@${ip}"
+    fi
+    echo
+    echo "Lost the key on your laptop? Get it back from this server:"
+    if [[ -n "$GENERATED_KEY_FILE" ]]; then
+      echo "  sudo cat $GENERATED_KEY_FILE"
+      echo "  ...then paste it into ~/.ssh/${NEW_USER}_key on your laptop."
+    fi
+    echo
+    echo "Forgot any of the above? Re-print it with:"
+    echo "  cd ~/vps-harden && sudo ./vps-harden.sh --info"
+  } >"$CREDS"
+  chmod 600 "$CREDS"
+
+  # A copy the user can read without sudo once they are in.
+  if [[ -n "$NEW_USER" ]] && id "$NEW_USER" >/dev/null 2>&1; then
+    local home; home="$(eval echo "~$NEW_USER")"
+    if [[ -d "$home" ]]; then
+      grep -v '^Password    :' "$CREDS" | grep -v 'console / su only' >"$home/vps-harden-login.txt" || true
+      chown "$NEW_USER:$NEW_USER" "$home/vps-harden-login.txt" 2>/dev/null || true
+      chmod 600 "$home/vps-harden-login.txt" 2>/dev/null || true
+    fi
+  fi
+  ok "Login details saved to $CREDS"
+}
+
+# --info: reconstruct the login details from the live system.
+#
+# The whole point is that it works when the user has lost everything and is
+# sitting at the provider's rescue console, so it reads the running config
+# rather than trusting variables from an earlier run.
+show_info() {
+  local port user_list ip keyfile
+  port="$(sshd_effective port)"; port="${port:-22}"
+  ip="$(detect_ip)"
+  user_list="$(getent group sudo 2>/dev/null | awk -F: '{gsub(/,/, " ", $4); print $4}')"
+
+  hr
+  echo "${BLD}How to log into this server${NC}"
+  hr
+  echo "Server IP        : $ip"
+  echo "SSH port         : ${BLD}${port}${NC}"
+  echo "Sudo user(s)     : ${user_list:-none found}"
+  echo "Root SSH login   : $(sshd_effective permitrootlogin)"
+  echo "Password SSH auth: $(sshd_effective passwordauthentication)"
+  echo
+
+  if compgen -G "$KEYDIR/*_key" >/dev/null 2>&1; then
+    echo "${BLD}Private keys this script generated:${NC}"
+    for keyfile in "$KEYDIR"/*_key; do
+      local u; u="$(basename "$keyfile")"; u="${u%_key}"
+      echo "  $keyfile   -> for user '$u'"
+      echo "      ssh -i ~/.ssh/${u}_key -p ${port} ${u}@${ip}"
+    done
+    echo
+    echo "Don't have the key on your laptop? Print it and copy it out of this"
+    echo "window (this works even with SSH locked down):"
+    echo "    ${BLD}sudo cat $KEYDIR/<user>_key${NC}"
+  else
+    echo "No generated keys found in $KEYDIR/ (you supplied your own)."
+  fi
+  echo
+  [[ -f "$CREDS" ]] && { echo "Full details: ${BLD}sudo cat $CREDS${NC}"; echo; }
+  hr
+}
+
 # ----------------------------------------------------------------------------
 # Pre-flight
 # ----------------------------------------------------------------------------
@@ -207,6 +368,11 @@ preflight() {
   hr; log "Pre-flight checks"
   if [[ "$EUID" -ne 0 ]]; then err "Run as root (use sudo)."; exit 1; fi
 
+  # Defaults first: `set -u` turns an unreadable /etc/os-release into an
+  # "unbound variable" crash three lines later, on the exact path that is
+  # supposed to warn and carry on.
+  PRETTY_NAME="${PRETTY_NAME:-unknown OS}"
+  ID="${ID:-unknown}"
   if [[ -r /etc/os-release ]]; then
     . /etc/os-release
     case "$ID" in
@@ -326,7 +492,7 @@ do_user() {
   # Option B: no key pasted -> generate a fresh pair on the server.
   if [[ -z "$SSH_PUBKEY" ]]; then
     log "Generating a new SSH key pair for you..."
-    local keydir="/root/vps-harden-keys"
+    local keydir="$KEYDIR"
     local keyfile="$keydir/${NEW_USER}_key"
     install -d -m 700 "$keydir"
     if [[ ! -f "$keyfile" ]]; then
@@ -334,26 +500,31 @@ do_user() {
     fi
     SSH_PUBKEY="$(cat "${keyfile}.pub")"
     GENERATED_KEY_FILE="$keyfile"
-    ok "Created a key pair for you."
+    ok "Created a key pair for you: $keyfile"
+
+    # Also drop a copy in the user's own home.
+    #
+    # /root is unreadable to anyone but root, so a user who gets in through the
+    # provider's console as '$NEW_USER' (the password set above is exactly for
+    # that) could not reach their own key. Now they can just `cat` it.
+    local home_copy; home_copy="$(eval echo "~$NEW_USER")/${NEW_USER}_key"
+    if install -m 600 -o "$NEW_USER" -g "$NEW_USER" "$keyfile" "$home_copy" 2>/dev/null; then
+      ok "Copy of the key placed at $home_copy (readable by '$NEW_USER')"
+    fi
+
     echo
-    echo "${BLD}>>> ACTION REQUIRED: save your PRIVATE key to your laptop <<<${NC}"
-    echo "This secret key is your ONLY way to log in after this. Copy it now."
+    warn "Your key is on the SERVER. You must get it onto your LAPTOP."
+    echo "The script will print the whole key at the end so you can copy/paste it,"
+    echo "along with the exact login command. ${BLD}Don't close this window until you have.${NC}"
     echo
-    echo "${BLD}Easiest way:${NC} on your LAPTOP, open a new terminal and run this single line"
-    echo "(replace the IP with your server's IP). It copies the key down for you:"
-    echo
-    echo "    ${BLD}scp root@<server-ip>:${keyfile} ~/.ssh/${NEW_USER}_key${NC}"
-    echo
-    echo "Then fix its permissions on your laptop so SSH will accept it:"
-    echo "    ${BLD}chmod 600 ~/.ssh/${NEW_USER}_key${NC}"
-    echo
-    echo "After that you'll log in from your laptop with:"
-    echo "    ${BLD}ssh -i ~/.ssh/${NEW_USER}_key -p <ssh-port> ${NEW_USER}@<server-ip>${NC}"
-    echo
-    warn "Do this BEFORE you close your current connection. The script will remind you again at the end."
+    echo "If you'd rather download it as a file, do it ${BLD}NOW${NC}, from a second"
+    echo "terminal on your laptop, while root login still works on port 22:"
+    echo "    ${BLD}scp root@$(detect_ip):${keyfile} ~/.ssh/${NEW_USER}_key${NC}"
+    warn "That scp stops working in a minute: this script is about to disable root"
+    warn "SSH login and (maybe) move the SSH port. Copy/paste at the end always works."
     echo
     if [[ "$ASSUME_YES" != "yes" ]]; then
-      read -r -p "${YLW}[?]${NC} Press Enter once you understand (you'll copy the key shortly)... " _
+      read -r -p "${YLW}[?]${NC} Press Enter to continue... " _
     fi
   fi
 
@@ -376,7 +547,12 @@ do_user() {
 do_ssh() {
   hr; log "Hardening SSH"
 
-  [[ "$SSH_PORT" == "22" ]] && SSH_PORT="$(ask 'SSH port to use (non-default recommended, or "auto")' '22')"
+  if [[ "$SSH_PORT" == "22" ]]; then
+    echo "SSH currently listens on port 22. You can move it to cut down brute-force"
+    echo "noise. Whatever you choose, you must use it in EVERY future ssh command"
+    echo "(ssh -p <port> ...). Press Enter to stay on 22 - that is a fine choice."
+    SSH_PORT="$(ask 'SSH port to use (or "auto" to pick a random one)' '22')"
+  fi
 
   # SSH_PORT=auto / --auto-port: let the script choose a free high port.
   if [[ "$SSH_PORT" == "auto" ]]; then
@@ -434,8 +610,9 @@ do_ssh() {
 # Managed by vps-harden.sh ($TIMESTAMP)
 # Named 00- on purpose: sshd uses the FIRST value it sees for a keyword, and
 # this directory is Included alphabetically. Do not rename this to 99-.
+# ('Protocol 2' is not set: it was removed in OpenSSH 7.6 and now only logs a
+#  "Deprecated option" warning on every start.)
 Port ${SSH_PORT}
-Protocol 2
 PermitRootLogin no
 PubkeyAuthentication yes
 PasswordAuthentication $([[ "$can_disable_pw" == "yes" ]] && echo no || echo yes)
@@ -444,7 +621,12 @@ KbdInteractiveAuthentication no
 UsePAM yes
 X11Forwarding no
 AllowAgentForwarding no
-AllowTcpForwarding no
+# Left ON deliberately. An SSH tunnel (ssh -L 3000:localhost:3000) is how you
+# are meant to reach Dokploy's admin panel and any other internal service, and
+# 'no' silently kills that with "channel: open failed: administratively
+# prohibited" - while the alternative, publishing port 3000 to the internet, is
+# far worse. It only matters to someone who already holds your private key.
+AllowTcpForwarding yes
 PermitEmptyPasswords no
 MaxAuthTries 3
 MaxSessions 5
@@ -466,17 +648,37 @@ EOF
     eff_port="$(sshd_effective port)"
     ok "SSH hardened (port ${eff_port:-$SSH_PORT}, root login ${eff_root:-unknown}, password auth ${eff_pw:-unknown})"
 
+    # Everything downstream (UFW, Fail2ban, the final summary, the credentials
+    # file) must agree with the port sshd is ACTUALLY listening on. If they
+    # drift, UFW opens a port nothing is serving and closes the one that is.
+    [[ -n "$eff_port" ]] && SSH_PORT="$eff_port"
+
     if [[ "$can_disable_pw" == "yes" && "$eff_pw" == "yes" ]]; then
       err "Asked sshd to disable password auth, but it is still enabled."
       err "Something in /etc/ssh/sshd_config.d/ or sshd_config overrides us; check: sshd -T | grep -i password"
     fi
 
+    # Say the port out loud, on its own, right where it changes. Buried in a
+    # sentence it gets scrolled past - and a port you cannot remember is the
+    # same as a locked door.
+    echo
+    echo "${BLD}    +--------------------------------------------------+${NC}"
+    printf '%s    |  YOUR SSH PORT IS NOW: %-25s |%s\n' "$BLD" "${eff_port:-$SSH_PORT}" "$NC"
+    echo "${BLD}    +--------------------------------------------------+${NC}"
+    echo "    Write it down. You need it in every ssh/scp command from now on."
+    echo "    Forgot it later? Run:  sudo ./vps-harden.sh --info"
+    echo
     warn "Keep this window open. From your LAPTOP, test a NEW login before closing it:"
-    echo "    ssh -p ${eff_port:-$SSH_PORT} ${NEW_USER:-<user>}@<server-ip>"
+    echo "    ssh -p ${eff_port:-$SSH_PORT} ${NEW_USER:-<user>}@$(detect_ip)"
   else
     err "sshd config test failed - reverting."
     rm -f "$conf"
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+    # We reverted, so the port we wanted never took effect. Fall back to the
+    # real one or UFW will open a port nothing is listening on.
+    local reverted; reverted="$(sshd_effective port)"
+    SSH_PORT="${reverted:-22}"
+    warn "SSH is still on port $SSH_PORT."
   fi
 }
 
@@ -749,6 +951,15 @@ run_audit() {
 # Main
 # ----------------------------------------------------------------------------
 main() {
+  # --info runs BEFORE preflight on purpose: preflight exits when the box has no
+  # internet, and "I need to know my SSH port" is exactly the situation where
+  # you are on a rescue console with limited connectivity.
+  if [[ "$INFO_ONLY" == "yes" ]]; then
+    if [[ "$EUID" -ne 0 ]]; then err "Run as root (use sudo)."; exit 1; fi
+    show_info
+    exit 0
+  fi
+
   preflight
 
   if [[ "$AUDIT_ONLY" == "yes" ]]; then
@@ -771,8 +982,22 @@ main() {
   do_misc
   run_audit
 
+  write_credentials "$SSH_PORT"
+
+  local ip; ip="$(detect_ip)"
+
   hr
   ok "Done. Your server has been hardened."
+  echo
+
+  # The three facts people lose, together, in one place, before anything else.
+  echo "${BLD}    +--------------------------------------------------+${NC}"
+  printf '%s    |  %-46s  |%s\n' "$BLD" "SERVER   : $ip" "$NC"
+  printf '%s    |  %-46s  |%s\n' "$BLD" "USERNAME : ${NEW_USER:-<none>}" "$NC"
+  printf '%s    |  %-46s  |%s\n' "$BLD" "SSH PORT : $SSH_PORT" "$NC"
+  echo "${BLD}    +--------------------------------------------------+${NC}"
+  echo "    Saved on the server at: $CREDS"
+  echo "    Show it again anytime:  sudo ./vps-harden.sh --info"
   echo
 
   # Show the account password. If we generated it, this is the ONLY time it's
@@ -790,18 +1015,20 @@ main() {
   fi
 
   if [[ -n "$GENERATED_KEY_FILE" ]]; then
-    echo "${BLD}>>> FIRST: copy your private key to your laptop (if you haven't) <<<${NC}"
-    echo "On your LAPTOP:"
-    echo "    scp root@<server-ip>:${GENERATED_KEY_FILE} ~/.ssh/${NEW_USER}_key"
-    echo "    chmod 600 ~/.ssh/${NEW_USER}_key"
+    # Note what is NOT here any more: `scp root@...`. Root SSH login was
+    # disabled a few steps ago and the port may have moved, so that command
+    # could never have worked at this point in the run - it just looked like it
+    # should, and sent people off to fight "Permission denied" instead of
+    # copying the key that was on screen in front of them.
+    print_private_key "$GENERATED_KEY_FILE" "$NEW_USER" "$SSH_PORT"
     echo
     echo "${BLD}>>> THEN test the new login BEFORE closing this window <<<${NC}"
     echo "On your LAPTOP, in a NEW terminal:"
-    echo "    ${BLD}ssh -i ~/.ssh/${NEW_USER}_key -p ${SSH_PORT} ${NEW_USER}@<server-ip>${NC}"
+    echo "    ${BLD}ssh -i ~/.ssh/${NEW_USER}_key -p ${SSH_PORT} ${NEW_USER}@${ip}${NC}"
   else
     echo "${BLD}>>> IMPORTANT: do this BEFORE closing this window <<<${NC}"
     echo "On your LAPTOP, open a NEW terminal window and test the new login:"
-    echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@<server-ip>${NC}"
+    echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-<user>}@${ip}${NC}"
   fi
   echo "  - If it works: you can safely close THIS window. You're done."
   echo "  - If it fails: keep THIS window open and fix it here."
@@ -809,9 +1036,9 @@ main() {
     echo
     echo "To open Dokploy, run this on your LAPTOP, then visit http://localhost:3000 :"
     if [[ -n "$GENERATED_KEY_FILE" ]]; then
-      echo "    ${BLD}ssh -i ~/.ssh/${NEW_USER}_key -p ${SSH_PORT} ${NEW_USER}@<server-ip> -L 3000:localhost:3000${NC}"
+      echo "    ${BLD}ssh -i ~/.ssh/${NEW_USER}_key -p ${SSH_PORT} ${NEW_USER}@${ip} -L 3000:localhost:3000${NC}"
     else
-      echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-root}@<server-ip> -L 3000:localhost:3000${NC}"
+      echo "    ${BLD}ssh -p ${SSH_PORT} ${NEW_USER:-root}@${ip} -L 3000:localhost:3000${NC}"
     fi
   }
   echo
