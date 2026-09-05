@@ -375,19 +375,39 @@ show_info() {
 # nothing has been modified, so warning about a half-hardened box would be a
 # lie - and a scary one.
 CURRENT_STEP=""
+INTERRUPTED="no"
+
+on_interrupt() {
+  INTERRUPTED="yes"
+  exit 130
+}
+
 on_crash() {
   local code=$?
   [[ $code -eq 0 ]] && return 0
   [[ -z "$CURRENT_STEP" ]] && return 0
   echo >&2
-  err "The script STOPPED UNEXPECTEDLY during: ${CURRENT_STEP}"
-  err "Your server is only PARTIALLY hardened. Do not assume it is secure."
+  if [[ "$INTERRUPTED" == "yes" ]]; then
+    warn "You stopped the script (Ctrl+C) during: ${CURRENT_STEP}"
+  else
+    err "The script STOPPED UNEXPECTEDLY during: ${CURRENT_STEP}"
+  fi
+  err "Your server is only PARTIALLY hardened. Do NOT assume it is secure."
   echo >&2
-  echo "  Check what actually applied:  sudo ./vps-harden.sh --audit-only" >&2
-  echo "  See your login details:       sudo ./vps-harden.sh --info" >&2
-  echo "  It is safe to just run it again: sudo ./vps-harden.sh" >&2
+  if [[ -n "${NEW_USER:-}" ]]; then
+    echo "  A user may exist without SSH being locked down yet." >&2
+  fi
+  echo "  See exactly what applied:  sudo ./vps-harden.sh --audit-only" >&2
+  echo "  See your login details:    sudo ./vps-harden.sh --info" >&2
+  echo "  Finish the job - it is safe to run again:  sudo ./vps-harden.sh" >&2
   echo >&2
 }
+
+# Two traps, not one. An UNTRAPPED fatal signal terminates the shell without
+# running the EXIT trap, so Ctrl+C would leave a half-hardened box in total
+# silence - a user who quit at a confusing prompt got a server with a new user,
+# a new key, and SSH still wide open, with nothing on screen to say so.
+trap on_interrupt INT TERM
 trap on_crash EXIT
 
 # ----------------------------------------------------------------------------
@@ -544,18 +564,25 @@ do_user() {
     fi
 
     echo
-    warn "Your key is on the SERVER. You must get it onto your LAPTOP."
-    echo "The script will print the whole key at the end so you can copy/paste it,"
-    echo "along with the exact login command. ${BLD}Don't close this window until you have.${NC}"
+    echo "${BLD}Nothing for you to do right now.${NC} Your key is saved on the server,"
+    echo "and the script will print it in full at the very end, together with the"
+    echo "exact command to log in. Just keep this window open until then."
     echo
-    echo "If you'd rather download it as a file, do it ${BLD}NOW${NC}, from a second"
-    echo "terminal on your laptop, while root login still works on port 22:"
+    echo "(Optional: if you'd rather download it as a file instead of copy/pasting"
+    echo "it later, run this NOW in a second terminal on your laptop, while root"
+    echo "login still works on port 22:"
     echo "    ${BLD}scp root@$(detect_ip):${keyfile} ~/.ssh/${NEW_USER}_key${NC}"
-    warn "That scp stops working in a minute: this script is about to disable root"
-    warn "SSH login and (maybe) move the SSH port. Copy/paste at the end always works."
+    echo "It stops working once this run disables root SSH login.)"
+    echo
+    # Say what quitting here costs. A user who bailed at this prompt because it
+    # looked like homework got a box with a new user, a new key and SSH still
+    # wide open - and no indication anything was unfinished.
+    warn "IMPORTANT: your server is NOT secured yet. SSH hardening, the firewall"
+    warn "and Fail2ban all come AFTER this point. If you quit now, you are left"
+    warn "with an open server."
     echo
     if [[ "$ASSUME_YES" != "yes" ]]; then
-      read -r -p "${YLW}[?]${NC} Press Enter to continue... " _
+      read -r -p "${YLW}[?]${NC} Press Enter to carry on securing the server... " _
     fi
   fi
 
