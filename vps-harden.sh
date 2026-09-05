@@ -362,6 +362,35 @@ show_info() {
 }
 
 # ----------------------------------------------------------------------------
+# Crash handler
+# ----------------------------------------------------------------------------
+# `set -e` makes any unguarded failure exit instantly, and the script then just
+# stopped mid-run with no explanation. That is how a box ended up with a user
+# and a key but no SSH hardening, no firewall and no summary - and the user had
+# no way to tell, because nothing said the run had died.
+#
+# Now a crash says so, loudly, and says what to do about it.
+# Empty until the first step that actually changes the system. Intentional
+# early exits (not root, no internet, user answered "no") must stay quiet:
+# nothing has been modified, so warning about a half-hardened box would be a
+# lie - and a scary one.
+CURRENT_STEP=""
+on_crash() {
+  local code=$?
+  [[ $code -eq 0 ]] && return 0
+  [[ -z "$CURRENT_STEP" ]] && return 0
+  echo >&2
+  err "The script STOPPED UNEXPECTEDLY during: ${CURRENT_STEP}"
+  err "Your server is only PARTIALLY hardened. Do not assume it is secure."
+  echo >&2
+  echo "  Check what actually applied:  sudo ./vps-harden.sh --audit-only" >&2
+  echo "  See your login details:       sudo ./vps-harden.sh --info" >&2
+  echo "  It is safe to just run it again: sudo ./vps-harden.sh" >&2
+  echo >&2
+}
+trap on_crash EXIT
+
+# ----------------------------------------------------------------------------
 # Pre-flight
 # ----------------------------------------------------------------------------
 preflight() {
@@ -397,9 +426,11 @@ preflight() {
 do_update() {
   hr; log "Updating system packages"
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get upgrade -y
-  apt-get dist-upgrade -y
+  # Not fatal: a held package or a transient mirror error used to kill the
+  # whole run here, before a single hardening step had happened.
+  apt-get update -y || warn "apt-get update reported errors; continuing."
+  apt-get upgrade -y || warn "apt-get upgrade reported errors; continuing."
+  apt-get dist-upgrade -y || warn "apt-get dist-upgrade reported errors; continuing."
   apt-get install -y \
     ufw fail2ban unattended-upgrades apt-listchanges \
     curl wget ca-certificates gnupg lsb-release \
@@ -822,25 +853,75 @@ EOF
 # ----------------------------------------------------------------------------
 # 8. Optional Dokploy install
 # ----------------------------------------------------------------------------
+# Ask about Dokploy WITHOUT installing it.
+#
+# The firewall step needs to know the answer (it opens 80/443 and warns about
+# the 3000 panel), but the install itself must not run this early - see
+# do_dokploy below for why.
+ask_dokploy() {
+  if [[ -z "$INSTALL_DOKPLOY" ]]; then
+    hr; log "Dokploy"
+    echo "Dokploy is an optional deployment panel. It is installed at the END,"
+    echo "after your server is secured."
+    if confirm "Install Dokploy on this server?"; then INSTALL_DOKPLOY="yes"; else INSTALL_DOKPLOY="no"; fi
+  fi
+}
+
+# Install Dokploy. Runs LAST, on purpose, and can never abort the run.
+#
+# This used to run BEFORE every security step, and called the installer as a
+# bare `curl ... | sh` under `set -euo pipefail`. So any non-zero exit from
+# Dokploy's installer killed the whole script on that line - skipping SSH
+# hardening, the firewall, Fail2ban, sysctl and the audit, and printing no
+# summary at all. The result was a box the user believed was hardened while
+# `sshd -T` still reported `permitrootlogin yes` and `passwordauthentication
+# yes`, with no SSH port ever displayed because the script never got that far.
+#
+# Two changes make that impossible now: hardening completes before we get here,
+# and a failed install is a warning rather than a fatal error.
 do_dokploy() {
   hr; log "Dokploy installation"
-  if [[ -z "$INSTALL_DOKPLOY" ]]; then
-    if confirm "Install Dokploy now?"; then INSTALL_DOKPLOY="yes"; else INSTALL_DOKPLOY="no"; fi
-  fi
-  if [[ "$INSTALL_DOKPLOY" != "yes" ]]; then warn "Skipping Dokploy."; return; fi
+  if [[ "$INSTALL_DOKPLOY" != "yes" ]]; then warn "Skipping Dokploy."; return 0; fi
 
+  local p
   for p in 80 443 3000; do
     if ss -tulnp 2>/dev/null | grep -q ":$p "; then
-      err "Port $p is already in use. Dokploy needs 80, 443 and 3000 free. Aborting Dokploy install."
-      return
+      err "Port $p is already in use. Dokploy needs 80, 443 and 3000 free."
+      warn "Skipping the Dokploy install. Your server is still hardened."
+      return 0
     fi
   done
 
   log "Running official Dokploy installer (this can take a few minutes)..."
-  curl -sSL https://dokploy.com/install.sh | sh
-  ok "Dokploy installed. Panel: http://<server-ip>:3000 (or via SSH tunnel)."
-  warn "Re-run the firewall step if you installed Docker for the first time:"
-  echo "    sudo /usr/local/bin/ufw-docker install && sudo systemctl restart ufw"
+  if curl -fsSL https://dokploy.com/install.sh -o /tmp/dokploy-install.sh; then
+    if sh /tmp/dokploy-install.sh; then
+      ok "Dokploy installed."
+      echo "    Reach the panel from your LAPTOP over an SSH tunnel:"
+      echo "      ssh -p ${SSH_PORT} ${NEW_USER:-root}@$(detect_ip) -L 3000:localhost:3000"
+      echo "    then open http://localhost:3000"
+
+      # Dokploy brings Docker with it, and Docker punches its own iptables
+      # rules straight past UFW. Re-apply the fix now that Docker exists
+      # instead of printing a command and hoping the user runs it.
+      if [[ -x /usr/local/bin/ufw-docker ]]; then
+        log "Re-applying the Docker<->UFW fix now that Docker is installed"
+        /usr/local/bin/ufw-docker install >/dev/null 2>&1 || true
+        systemctl restart ufw >/dev/null 2>&1 || true
+        for p in $DOCKER_PUBLIC_PORTS; do allow_docker_port "$p"; done
+        ufw reload >/dev/null 2>&1 || true
+        ok "Docker traffic respects UFW"
+      fi
+    else
+      err "The Dokploy installer failed."
+      warn "Your server is still fully hardened - only Dokploy is missing."
+      warn "Retry it later with: curl -sSL https://dokploy.com/install.sh | sh"
+    fi
+    rm -f /tmp/dokploy-install.sh
+  else
+    err "Could not download the Dokploy installer (network problem?)."
+    warn "Your server is still fully hardened - only Dokploy is missing."
+  fi
+  return 0
 }
 
 # ----------------------------------------------------------------------------
@@ -972,15 +1053,21 @@ main() {
   warn "Keep THIS window open. After it finishes, test a new login from your LAPTOP before disconnecting."
   confirm "Continue with hardening?" || { log "Aborted."; exit 0; }
 
-  do_update
-  do_user
-  do_dokploy      # decide Dokploy first so firewall opens the right ports
-  do_ssh
-  do_firewall
-  do_fail2ban
-  do_sysctl
-  do_misc
-  run_audit
+  # CURRENT_STEP feeds the crash handler, so an unexpected exit can name the
+  # step it died in instead of just vanishing.
+  CURRENT_STEP="system update";        do_update
+  CURRENT_STEP="user + SSH key";       do_user
+  CURRENT_STEP="Dokploy question";     ask_dokploy   # ASK first, so the firewall
+                                                     # opens the right ports...
+  CURRENT_STEP="SSH hardening";        do_ssh
+  CURRENT_STEP="firewall";             do_firewall
+  CURRENT_STEP="Fail2ban";             do_fail2ban
+  CURRENT_STEP="kernel hardening";     do_sysctl
+  CURRENT_STEP="misc hardening";       do_misc
+  # ...but INSTALL last: a failing installer must never be able to skip the
+  # hardening above it, which is exactly what it used to do.
+  CURRENT_STEP="Dokploy install";      do_dokploy
+  CURRENT_STEP="security audit";       run_audit
 
   write_credentials "$SSH_PORT"
 
